@@ -18,8 +18,10 @@ import json
 import time
 import logging
 import threading
+import os
 from collections import deque
 
+import torch
 from google import genai
 
 from config_manager import get_api_key, get_stt_config
@@ -32,7 +34,14 @@ CONTEXT_WINDOW_SIZE = 3
 
 # ======================== Prompt ========================
 
-TRANSLATION_PROMPT = """你是一个专业的英中同声传译助手。请根据上下文翻译当前句子，严格返回 JSON。
+TRANSLATION_PROMPT = """你是一位极其专业的通用同声传译员。你的任务是将用户输入的流式英文语音识别结果翻译成中文。
+
+【核心挑战】：输入通常是不完整的片段（残句），并且可能包含由于机器听音导致的同音词错误。
+
+【你的职责】：
+1. 动态推理：请根据历史前文的内容，迅速判断当前所处的领域（如科技、娱乐、医学、日常闲聊等）。
+2. 智能纠错：利用你推测出的领域背景，自动修正当前句子中明显不合理的同音词识别错误。
+3. 意译输出：输出符合中文表达习惯的流畅翻译，不要逐字死翻。
 
 ## 历史上下文
 {context}
@@ -43,10 +52,9 @@ TRANSLATION_PROMPT = """你是一个专业的英中同声传译助手。请根�
 ## 翻译规则
 1. 当前输入是**完整句子** → final_translation 填最终翻译, draft_translation 填 ""
 2. 当前输入是**残句/片段** → final_translation 填 "", draft_translation 填暂定翻译
-3. 如果新上下文揭示**历史翻译有误**，在 final_translation 中纠正：格式 "[纠正] 原译:xxx → 应译为:xxx"
-4. 翻译流畅自然，符合中文表达
+3. 注意语义连贯性，结合上文判断当前片段是否构成了完整语义
 
-## 严格 JSON
+## 严格 JSON（必须遵守）
 ```json
 {{
   "final_translation": "...",
@@ -62,50 +70,83 @@ class LocalTranslator:
 
     def __init__(self):
         from transformers import AutoModelForCausalLM, AutoTokenizer
-        from modelscope import snapshot_download
-        import torch, os
 
         model_name = "Qwen/Qwen2.5-0.5B-Instruct"
         logger.info("正在加载 Qwen2.5-0.5B 翻译模型 (~1GB)...")
 
-        # 用 ModelScope 国内镜像下载，速度快
-        local_path = snapshot_download(model_name)
+        # 先查本地缓存，避免每次启动都联网（网络不稳时会卡死）
+        cache_root = os.path.expanduser("~/.cache/modelscope/hub/models")
+        owner, repo = model_name.split("/")
+        safe_repo = repo.replace(".", "___")
+        local_path = os.path.join(cache_root, owner, safe_repo)
+
+        if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "model.safetensors")):
+            logger.info("使用本地缓存: %s", local_path)
+        else:
+            try:
+                from modelscope import snapshot_download
+                local_path = snapshot_download(model_name)
+            except Exception as e:
+                logger.warning("ModelScope 下载失败 (%s)，尝试已有缓存...", e)
+                # 回退：直接找缓存目录中匹配的文件夹
+                owner_dir = os.path.join(cache_root, owner)
+                if os.path.isdir(owner_dir):
+                    for d in os.listdir(owner_dir):
+                        if d.startswith(safe_repo[:6]):
+                            local_path = os.path.join(owner_dir, d)
+                            if os.path.isdir(local_path):
+                                logger.info("回退到缓存: %s", local_path)
+                                break
         logger.info("模型路径: %s", local_path)
 
-        torch.set_num_threads(4)
+        torch.set_num_threads(max(1, os.cpu_count() - 2))
         self._tokenizer = AutoTokenizer.from_pretrained(
             local_path, trust_remote_code=True, local_files_only=True,
         )
         self._model = AutoModelForCausalLM.from_pretrained(
             local_path, trust_remote_code=True, local_files_only=True,
-            torch_dtype=torch.float32, device_map="cpu",
+            dtype=torch.float32, device_map="cpu",
         )
         self._model.eval()
-        logger.info("Qwen 翻译模型就绪")
+        logger.info("Qwen 翻译模型就绪 (CPU 线程数: %d)", torch.get_num_threads())
 
     def translate(self, text: str) -> str:
         if not text.strip():
             return ""
         try:
+            # few-shot 示例：教小模型理解"翻译 = 输出中文"的格式
             messages = [
-                {"role": "system", "content": "你是一个专业英中翻译。把以下英文翻译成中文，只输出中文译文，不要解释。"},
-                {"role": "user", "content": text},
+                {"role": "system", "content": "你是英中翻译器。唯一任务：把用户输入的英文翻译成中文。禁止输出英文单词。只输出中文译文。不要解释。"},
+                {"role": "user", "content": "翻译: Hello, how are you today?"},
+                {"role": "assistant", "content": "你今天好吗？"},
+                {"role": "user", "content": "翻译: " + text},
             ]
             prompt = self._tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True
             )
             inputs = self._tokenizer(prompt, return_tensors="pt")
-            outputs = self._model.generate(
-                **inputs, max_new_tokens=128, do_sample=False,
-                pad_token_id=self._tokenizer.eos_token_id,
-            )
+            with torch.inference_mode():
+                outputs = self._model.generate(
+                    **inputs, max_new_tokens=64, do_sample=False, num_beams=1,
+                    pad_token_id=self._tokenizer.eos_token_id,
+                )
             result = self._tokenizer.decode(
                 outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True
             ).strip()
+
+            # 兜底检测：如果输出大部分是英文单词，说明模型没听话，标记为翻译失败
+            if result:
+                words = result.split()
+                if len(words) >= 3:
+                    en_count = sum(1 for w in words if w[:1].isascii() and w[:1].isalpha())
+                    if en_count / len(words) > 0.5:
+                        logger.warning("Qwen 输出含大量英文，疑似翻译失败: %s", result[:80])
+                        return "[翻译失败]"
+
             return result
         except Exception as e:
             logger.error("Qwen 翻译失败: %s", e)
-            return f"[翻译错误]"
+            return "[翻译错误]"
 
 
 # ======================== Gemini 翻译引擎 ========================
@@ -225,6 +266,23 @@ def ai_worker_thread(
 
         if audio_chunk is None:
             logger.info("收到停止信号，退出")
+            break
+
+        # 跳过积压的旧音频块，只保留最新
+        dropped = 0
+        while True:
+            try:
+                audio_chunk = audio_queue.get_nowait()
+                if audio_chunk is None:
+                    logger.info("收到停止信号（跳过%d个积压块），退出", dropped)
+                    break
+                dropped += 1
+            except queue.Empty:
+                break
+        if dropped:
+            logger.info("跳过 %d 个积压音频块，只处理最新", dropped)
+
+        if audio_chunk is None:
             break
 
         # STT 识别

@@ -180,12 +180,17 @@ class SubtitleOverlay(QWidget):
     def update_labels(self, data: dict):
         final = data.get("final_translation", "")
         draft = data.get("draft_translation", "")
-        if final:
+
+        # 始终同步设置两个 label，空串即清空，避免旧文字残留重叠
+        if final and not final.startswith("["):
             self.final_label.setText(final)
-        if draft:
+        else:
+            self.final_label.setText("")
+
+        if draft and not draft.startswith("["):
             self.draft_label.setText(draft)
-        if data.get("_error"):
-            self.draft_label.setText(f"[出错] {data['_error'][:80]}")
+        else:
+            self.draft_label.setText("")
 
     # ---------- 生命周期 ----------
 

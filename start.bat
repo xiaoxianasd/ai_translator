@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 chcp 65001 >nul
 cd /d "%~dp0"
 title AI 同声传译助手
@@ -19,7 +20,24 @@ if exist "%VENV%\Scripts\python.exe" (
     goto :check
 )
 
-:: 2) 再找系统安装的 Python
+:: 2) 优先用 Anaconda / Miniconda
+for %%d in (
+    "%USERPROFILE%\Anaconda3"
+    "%USERPROFILE%\anaconda3"
+    "%USERPROFILE%\Miniconda3"
+    "%USERPROFILE%\miniconda3"
+    "F:\Anaconda3"
+    "C:\ProgramData\Anaconda3"
+    "C:\Anaconda3"
+) do (
+    if exist "%%~d\python.exe" (
+        set SYSTEM_PYTHON=%%~d\python.exe
+        echo [OK] 找到 Anaconda: !SYSTEM_PYTHON!
+        goto :setup_venv
+    )
+)
+
+:: 3) 再找系统安装的 Python
 where python >nul 2>&1
 if %ERRORLEVEL%==0 (
     for /f "delims=" %%i in ('python -c "import sys; print(sys.executable)"') do set SYSTEM_PYTHON=%%i
@@ -27,7 +45,7 @@ if %ERRORLEVEL%==0 (
     goto :setup_venv
 )
 
-:: 3) 找 Microsoft Store 安装的 Python
+:: 4) 找 Microsoft Store 安装的 Python
 where python3 >nul 2>&1
 if %ERRORLEVEL%==0 (
     set SYSTEM_PYTHON=python3
@@ -35,7 +53,7 @@ if %ERRORLEVEL%==0 (
     goto :setup_venv
 )
 
-:: 4) 都没找到
+:: 5) 都没找到
 echo [ERROR] 未找到 Python，请先安装 Python 3.10+:
 echo   https://www.python.org/downloads/
 echo   安装时请勾选 "Add Python to PATH"
@@ -46,7 +64,7 @@ exit /b 1
 :setup_venv
 echo.
 echo 正在创建虚拟环境...
-call !SYSTEM_PYTHON! -m venv "%VENV%" --clear
+"!SYSTEM_PYTHON!" -m venv "%VENV%" --clear
 if %ERRORLEVEL% NEQ 0 (
     echo [ERROR] 虚拟环境创建失败
     pause

@@ -3,6 +3,7 @@ pyaudiowpatch
 faster-whisper
 transformers
 torch
+accelerate
 modelscope
 PyQt5
 google-genai

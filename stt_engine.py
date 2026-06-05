@@ -165,9 +165,15 @@ class FasterWhisperSTT(BaseSTTEngine):
     """
 
     def __init__(self, model_size: str = "tiny", device: str = "cpu", language: str = "en"):
+        import os as _os, sys as _sys
+        if _sys.platform == "win32":
+            import torch as _torch
+            _torch_lib = _os.path.join(_os.path.dirname(_torch.__file__), "lib")
+            _os.add_dll_directory(_torch_lib)
         from faster_whisper import WhisperModel
 
         self._language = language
+        self._memory = ""  # 动态记忆池，随识别累积，用作 initial_prompt 提供上下文
         logger.info("正在加载 Faster-Whisper 模型 (%s)...", model_size)
         self._model = WhisperModel(
             model_size, device=device, compute_type="int8",
@@ -176,12 +182,13 @@ class FasterWhisperSTT(BaseSTTEngine):
         logger.info("Faster-Whisper 模型就绪 (%s)", model_size)
 
     def transcribe(self, audio_chunk: np.ndarray) -> str:
-        """本地识别音频块"""
+        """本地识别音频块，利用历史上下文提高准确率"""
         try:
             segments, _ = self._model.transcribe(
                 audio_chunk.astype(np.float32),
                 language=self._language,
-                beam_size=5,
+                beam_size=1,
+                initial_prompt=self._memory or None,
                 vad_filter=True,
                 vad_parameters=dict(
                     min_silence_duration_ms=300,
@@ -192,6 +199,8 @@ class FasterWhisperSTT(BaseSTTEngine):
 
             if transcript:
                 logger.debug("Whisper 识别: %s", transcript)
+                # 追加到记忆池，滑动窗口只保留最后 200 个字符
+                self._memory = (self._memory + " " + transcript)[-200:].strip()
             return transcript
         except Exception as e:
             logger.error("Faster-Whisper 识别失败: %s", e)

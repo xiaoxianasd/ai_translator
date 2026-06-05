@@ -21,6 +21,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
+import torch  # noqa: E402  — 必须在 PyQt5 之前导入，否则 DLL 搜索冲突
+
 from PyQt5.QtWidgets import QApplication
 
 from audio_capture import start_audio_capture
@@ -34,7 +36,7 @@ logger = logging.getLogger("main")
 
 def main():
     print("=" * 60)
-    print("  AI 同声传译助手 v0.5")
+    print("  AI 同声传译助手 v0.6")
     print("  100% 本地运行 · 永久免费")
     print("=" * 60)
     print()
