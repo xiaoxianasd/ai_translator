@@ -1,0 +1,9 @@
+numpy
+pyaudiowpatch
+faster-whisper
+transformers
+torch
+modelscope
+PyQt5
+google-genai
+httpx
