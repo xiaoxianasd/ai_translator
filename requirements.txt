@@ -2,6 +2,7 @@ numpy
 pyaudiowpatch
 faster-whisper
 torch
+torchaudio
 llama-cpp-python==0.3.16
 huggingface_hub
 PyQt5

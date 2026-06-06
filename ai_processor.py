@@ -19,7 +19,7 @@ import time
 import logging
 import threading
 import os
-from collections import deque
+import concurrent.futures
 
 from google import genai
 
@@ -33,33 +33,19 @@ CONTEXT_WINDOW_SIZE = 3
 
 # ======================== Prompt ========================
 
-TRANSLATION_PROMPT = """你是一位极其专业的通用同声传译员。你的任务是将用户输入的流式英文语音识别结果翻译成中文。
-
-【核心挑战】：输入通常是不完整的片段（残句），并且可能包含由于机器听音导致的同音词错误。
-
-【你的职责】：
-1. 动态推理：请根据历史前文的内容，迅速判断当前所处的领域（如科技、娱乐、医学、日常闲聊等）。
-2. 智能纠错：利用你推测出的领域背景，自动修正当前句子中明显不合理的同音词识别错误。
-3. 意译输出：输出符合中文表达习惯的流畅翻译，不要逐字死翻。
+TRANSLATION_PROMPT = """你是一位专业的同声传译员。请将最新的英文语音片段翻译成流畅的中文。
 
 ## 历史上下文
 {context}
 
-## 当前输入
+## 当前输入片段
 "{current}"
 
-## 翻译规则
-1. 当前输入是**完整句子** → final_translation 填最终翻译, draft_translation 填 ""
-2. 当前输入是**残句/片段** → final_translation 填 "", draft_translation 填暂定翻译
-3. 注意语义连贯性，结合上文判断当前片段是否构成了完整语义
-
-## 严格 JSON（必须遵守）
-```json
+请注意：当前片段可能是一个残句。请结合历史上下文，给出最符合当前语境的中文翻译。
+必须严格输出以下 JSON 格式：
 {{
-  "final_translation": "...",
-  "draft_translation": "..."
-}}
-```"""
+  "final_translation": "此处填写翻译结果"
+}}"""
 
 
 # ======================== 通用 JSON 解析器 ========================
@@ -95,6 +81,17 @@ def parse_translation_json(raw: str, fallback_text: str) -> dict:
     # 4) 彻底失败 → 兜底
     logger.warning("JSON 解析失败: %s", raw[:200])
     return {"final_translation": "", "draft_translation": fallback_text}
+
+
+def _english_ratio(text: str) -> float:
+    """返回文本中英文单词字符的占比，用于检测模型是否输出了英文原文"""
+    if not text:
+        return 0.0
+    english_chars = sum(1 for c in text if c.isascii() and c.isalpha())
+    total_chars = sum(1 for c in text if c.isalpha())
+    if total_chars == 0:
+        return 0.0
+    return english_chars / total_chars
 
 
 # ======================== Qwen 本地翻译引擎 ========================
@@ -197,21 +194,30 @@ class LocalTranslator:
         if not current_text.strip():
             return {"final_translation": "", "draft_translation": ""}
         try:
+            user_prompt = "请将下面这段英文翻译成流畅的中文。绝对不允许输出任何英文原文，不要有任何解释。\n\n"
+            if context_str:
+                user_prompt += f"【{context_str}】\n\n"
+            user_prompt += f"需要翻译的英文：\"{current_text}\"\n中文翻译结果："
+
             response = self._llm.create_chat_completion(
                 messages=[
-                    {"role": "system", "content": "你是英中翻译器。只输出中文译文。不要解释。"},
-                    {"role": "user", "content": f"翻译: {current_text}"},
+                    {"role": "system", "content": "你是专业的英中同声传译员。你的唯一任务是输出纯中文译文。"},
+                    {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=48,
-                temperature=0,
+                max_tokens=64,
+                temperature=0.1,
             )
             raw = response["choices"][0]["message"]["content"].strip()
 
             if not raw:
-                return {"final_translation": "", "draft_translation": current_text}
+                return {"final_translation": "", "draft_translation": ""}
 
             if raw.startswith("{") and raw.endswith("}"):
                 return parse_translation_json(raw, current_text)
+
+            if _english_ratio(raw) > 0.4:
+                logger.warning("Qwen 输出英文占比过高 (%.0f%%)，丢弃: %s", _english_ratio(raw) * 100, raw[:80])
+                return {"final_translation": "", "draft_translation": ""}
 
             return {"final_translation": raw, "draft_translation": ""}
         except Exception as e:
@@ -222,17 +228,15 @@ class LocalTranslator:
 # ======================== Gemini 翻译引擎 ========================
 
 class TranslationEngine:
-    """Gemini 文本翻译引擎，维护滑动窗口上下文"""
+    """Gemini 文本翻译引擎（无状态设计，外部传入历史记录）"""
 
     def __init__(self, api_key: str):
         self._client = genai.Client(api_key=api_key)
-        self._en_history: deque[str] = deque(maxlen=CONTEXT_WINDOW_SIZE)
-        self._zh_history: deque[str] = deque(maxlen=CONTEXT_WINDOW_SIZE)
 
-    def translate(self, current_text: str) -> dict:
-        if self._en_history:
+    def translate(self, current_text: str, en_hist: list, zh_hist: list) -> dict:
+        if en_hist:
             lines = []
-            for i, (en, zh) in enumerate(zip(self._en_history, self._zh_history), 1):
+            for i, (en, zh) in enumerate(zip(en_hist, zh_hist), 1):
                 lines.append(f"{i}. EN: \"{en}\"\n   ZH: \"{zh}\"")
             context_str = "\n".join(lines)
         else:
@@ -247,17 +251,9 @@ class TranslationEngine:
             raw_text = response.text or ""
         except Exception as e:
             logger.error("Gemini API 失败: %s", e)
-            return {"final_translation": "", "draft_translation": f"[API异常] {e}",
-                    "_error": str(e)[:100]}
+            return {"final_translation": "", "draft_translation": f"[API异常] {e}"}
 
-        result = self._parse_json(raw_text)
-
-        final = result.get("final_translation", "")
-        if final and current_text and not final.startswith("[纠正]"):
-            self._en_history.append(current_text)
-            self._zh_history.append(final)
-
-        return result
+        return self._parse_json(raw_text)
 
     def _parse_json(self, raw: str) -> dict:
         return parse_translation_json(raw, raw.strip()[:300])
@@ -281,7 +277,6 @@ def ai_worker_thread(
         stt_engine = create_stt_engine(stt_cfg["provider"], stt_cfg["api_key"])
 
     engine = None
-
     if api_key:
         try:
             engine = TranslationEngine(api_key)
@@ -289,30 +284,23 @@ def ai_worker_thread(
         except Exception as e:
             logger.error("Gemini 初始化失败: %s", e)
 
-    # 始终确保有本地翻译兜底（Gemini 失败时自动降级）
     if translator is None:
         try:
             translator = LocalTranslator()
         except Exception as e:
             logger.error("本地翻译加载失败: %s", e)
 
-    # 混合模式：本地+云端同时可用时，本地秒出草稿，云端精修
     hybrid = engine is not None and translator is not None
-
     stt_name = type(stt_engine).__name__
-    if hybrid:
-        tr_name = "Qwen 1.5B 秒出 + Gemini 精修"
-    elif engine:
-        tr_name = "Gemini"
-    elif translator:
-        tr_name = "Qwen 1.5B GGUF"
-    else:
-        tr_name = "未启用"
+    tr_name = "混合修正模式" if hybrid else ("纯云端" if engine else "纯本地")
     logger.info("AI 工作线程已启动 | STT=%s | 翻译=%s", stt_name, tr_name)
 
-    # 滑动窗口记忆池（供纯本地翻译及混合模式草稿使用）
-    en_history: deque[str] = deque(maxlen=CONTEXT_WINDOW_SIZE)
-    zh_history: deque[str] = deque(maxlen=CONTEXT_WINDOW_SIZE)
+    # 全局唯一真理状态
+    en_history: list[str] = []
+    zh_history: list[str] = []
+
+    api_executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    history_lock = threading.Lock()
 
     while True:
         try:
@@ -321,144 +309,91 @@ def ai_worker_thread(
             continue
 
         if audio_chunk is None:
-            logger.info("收到停止信号，退出")
             break
 
-        # 跳过积压的旧音频块，只保留最新
-        dropped = 0
-        while True:
-            try:
-                audio_chunk = audio_queue.get_nowait()
-                if audio_chunk is None:
-                    logger.info("收到停止信号（跳过%d个积压块），退出", dropped)
-                    break
-                dropped += 1
-            except queue.Empty:
-                break
-        if dropped:
-            logger.info("跳过 %d 个积压音频块，只处理最新", dropped)
-
-        if audio_chunk is None:
-            break
-
-        # STT 识别
         try:
             english_text = stt_engine.transcribe(audio_chunk)
         except Exception as e:
-            logger.exception("STT 异常")
-            result_queue.put({"source_text": "", "final_translation": "",
-                              "draft_translation": f"[STT异常: {e}]",
-                              "timestamp": time.time(), "_error": str(e)})
+            result_queue.put({"history": zh_history.copy(), "draft": f"[STT异常: {e}]"})
             continue
 
         if not english_text or english_text.startswith("["):
-            logger.debug("STT 无有效文本: %s", english_text)
-            # 空文本/错误也推送到队列，让 UI 知道状态
-            if english_text and english_text.startswith("["):
-                result_queue.put({"source_text": "", "final_translation": "",
-                                  "draft_translation": english_text,
-                                  "timestamp": time.time()})
             continue
 
         logger.debug("STT: %s", english_text)
 
-        # 翻译
         try:
             if hybrid:
-                # 组装中文历史供本地翻译纠错（不上英文，避免小模型续写）
-                if zh_history:
-                    context_str = "上文：" + "；".join(list(zh_history))
-                else:
-                    context_str = "暂无上文"
+                # 1. 获取当前状态并生成草稿
+                with history_lock:
+                    context_str = "上文：" + "；".join(zh_history) if zh_history else "暂无上文"
+                    current_history = list(zh_history)
 
-                # 本地秒出草稿
                 draft_result = translator.translate(english_text, context_str)
                 draft_zh = draft_result.get("draft_translation", "") or draft_result.get("final_translation", "")
-                entry = {
-                    "source_text": english_text,
-                    "final_translation": "",
-                    "draft_translation": draft_zh,
-                    "timestamp": time.time(),
-                }
-                result_queue.put(entry)
-                logger.info("[草稿] %s → %s", english_text, draft_zh[:60])
 
-                # Gemini 精修
-                try:
-                    gemini_result = engine.translate(english_text)
-                except Exception:
-                    gemini_result = None
+                # 推送当前已定型的历史 + 本次残句草稿
+                result_queue.put({"history": current_history, "draft": draft_zh})
 
-                final_zh = (gemini_result or {}).get("final_translation", "")
-                if final_zh and not final_zh.startswith("["):
-                    entry["final_translation"] = final_zh
-                    entry["timestamp"] = time.time()
-                    entry["_refined"] = True
-                    result_queue.put(entry)
-                    en_history.append(english_text)
-                    zh_history.append(final_zh)
-                    logger.info("[精修] %s → %s", english_text, final_zh[:60])
-                elif draft_zh and not draft_zh.startswith("["):
-                    # Gemini 失败，草稿直接升格为最终
-                    entry["final_translation"] = draft_zh
-                    result_queue.put(entry)
-                    en_history.append(english_text)
-                    zh_history.append(draft_zh)
+                # 2. 异步智能修正
+                def gemini_refine_task(en_text):
+                    with history_lock:
+                        en_hist_copy = list(en_history)
+                        zh_hist_copy = list(zh_history)
+
+                    result = engine.translate(en_text, en_hist_copy, zh_hist_copy)
+                    final = result.get("final_translation", "")
+
+                    if final and not final.startswith("["):
+                        with history_lock:
+                            if len(zh_history) > 0:
+                                zh_history[-1] = final
+                                en_history[-1] = en_history[-1] + " " + en_text
+                            else:
+                                zh_history.append(final)
+                                en_history.append(en_text)
+                            if len(zh_history) > CONTEXT_WINDOW_SIZE:
+                                zh_history.pop(0)
+                                en_history.pop(0)
+                            result_queue.put({"history": list(zh_history), "draft": ""})
+
+                api_executor.submit(gemini_refine_task, english_text)
 
             elif engine:
-                result = engine.translate(english_text)
-                entry = {
-                    "source_text": english_text,
-                    "final_translation": result.get("final_translation", ""),
-                    "draft_translation": result.get("draft_translation", ""),
-                    "timestamp": time.time(),
-                    "_error": result.get("_error"),
-                }
-                logger.info("[翻译] %s", json.dumps(entry, ensure_ascii=False, default=str))
-                result_queue.put(entry)
+                with history_lock:
+                    en_h, zh_h = list(en_history), list(zh_history)
+                res = engine.translate(english_text, en_h, zh_h)
+                final = res.get("final_translation", "")
+                if final:
+                    with history_lock:
+                        if len(zh_history) > 0:
+                            zh_history[-1] = final
+                            en_history[-1] += " " + english_text
+                        else:
+                            zh_history.append(final)
+                            en_history.append(english_text)
+                        if len(zh_history) > CONTEXT_WINDOW_SIZE:
+                            zh_history.pop(0); en_history.pop(0)
+                        result_queue.put({"history": list(zh_history), "draft": ""})
 
             elif translator:
-                # 组装中文历史（不上英文，避免小模型续写 EN/ZH 模式）
-                if zh_history:
-                    context_str = "上文：" + "；".join(list(zh_history))
-                else:
-                    context_str = "暂无上文"
-
+                with history_lock:
+                    context_str = "上文：" + "；".join(zh_history) if zh_history else "暂无上文"
                 result = translator.translate(english_text, context_str)
                 final_zh = result.get("final_translation", "")
                 draft_zh = result.get("draft_translation", "")
-
-                # 仅当 final 有效时才记入历史
                 if final_zh and not final_zh.startswith("[") and "[翻译" not in final_zh:
-                    en_history.append(english_text)
-                    zh_history.append(final_zh)
-
-                entry = {
-                    "source_text": english_text,
-                    "final_translation": final_zh,
-                    "draft_translation": draft_zh,
-                    "timestamp": time.time(),
-                }
-                logger.info("[翻译] %s → %s", english_text, (final_zh or draft_zh)[:60])
-                result_queue.put(entry)
-
-            else:
-                result_queue.put({
-                    "source_text": english_text,
-                    "final_translation": "",
-                    "draft_translation": f"[无翻译] {english_text}",
-                    "timestamp": time.time(),
-                })
+                    with history_lock:
+                        zh_history.append(final_zh)
+                        en_history.append(english_text)
+                        if len(zh_history) > CONTEXT_WINDOW_SIZE:
+                            zh_history.pop(0); en_history.pop(0)
+                result_queue.put({"history": list(zh_history), "draft": draft_zh if not final_zh else ""})
 
         except Exception as e:
             logger.exception("翻译异常")
-            result_queue.put({
-                "source_text": english_text,
-                "final_translation": "",
-                "draft_translation": f"[异常: {e}]",
-                "timestamp": time.time(), "_error": str(e),
-            })
 
+    api_executor.shutdown(wait=False)
     logger.info("AI 工作线程已退出")
 
 

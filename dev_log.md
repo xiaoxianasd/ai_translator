@@ -12,10 +12,11 @@
 9. [第七阶段：v0.6 稳定性与性能](#第七阶段v06-稳定性与性能)
 10. [第八阶段：v0.7 双轨状态机与 Qwen 深度优化](#第八阶段v07-双轨状态机与-qwen-深度优化)
 11. [第九阶段：v0.8 GGUF 量化 + 1.5B 模型升级](#第九阶段v08-gguf-量化--15b-模型升级)
-12. [最终架构](#最终架构)
-13. [文件清单](#文件清单)
-14. [运行方式](#运行方式)
-15. [经验教训](#经验教训)
+12. [第十阶段：v0.9 Silero VAD + 异步精修 + 多行滚动](#第十阶段v09-silero-vad--异步精修--多行滚动)
+13. [最终架构](#最终架构)
+14. [文件清单](#文件清单)
+15. [运行方式](#运行方式)
+16. [经验教训](#经验教训)
 
 ---
 
@@ -834,6 +835,316 @@ messages=[
 
 ---
 
+## 第十阶段：v0.9 Silero VAD + 异步精修 + 多行滚动
+
+**日期**：2026-06-06 ~ 2026-06-07
+
+**文件**：`audio_capture.py`, `ai_processor.py`, `stt_engine.py`, `ui_main.py`, `start.bat`, `requirements.txt`
+
+### 背景
+
+v0.8 的 Qwen GGUF 翻译引擎已经稳定，但实际使用中暴露了几个结构性问题：
+
+1. **能量 VAD 误判**：基于 RMS 的静音检测对环境噪声敏感，校准窗口可能偏高，轻声说话检测不到
+2. **Gemini 同步阻塞**：hybrid 模式下 Gemini 的网络请求在主流程中同步等待，导致音频队列积压
+3. **字幕无状态覆盖**：每条新翻译直接覆盖旧字幕，无法追溯修正，Gemini 精修到达时已无可修正的对象
+4. **Qwen 复读英文**：1.5B 模型偶发输出英文原文，Prompt 约束不够严格
+5. **Whisper 幻觉**：静音段有时会输出 "Thank you" / "Subscribe" 等 YouTube 套话
+6. **start.bat 每次重装**：缺乏依赖检测，已装好的环境也要走一遍安装流程
+
+本轮改造目标：端到端架构升级，每个模块都要触及。
+
+---
+
+### 10.1 Silero VAD 替换能量检测
+
+**文件**：`audio_capture.py`
+
+#### 旧方案
+
+能量 VAD：逐帧计算 RMS → 和校准的噪声基准比较 → 静音帧数累计 → 触发切片。
+
+问题：
+- 需要 50 帧校准，校准时若播放音频 → 噪声基准偏高 → 后续检测失聪
+- RMS 阈值对轻声不敏感
+- 纯 numpy 无法利用语音信号的时序特征
+
+#### 新方案
+
+Silero VAD（`snakers4/silero-vad`）：2MB 神经网络模型，通过 `torch.hub` 加载。
+
+```python
+# __init__ 中静态加载
+self.vad_model, utils = torch.hub.load(
+    repo_or_dir='snakers4/silero-vad',
+    model='silero_vad',
+    force_reload=False
+)
+self.VADIterator = utils[3]  # VADIterator 类
+self.calibrated.set()         # 神经网络无需校准，直接放行
+```
+
+VADIterator 状态机：
+```python
+vad_iterator = self.VADIterator(model, threshold=0.5,
+    sampling_rate=TARGET_SAMPLE_RATE, min_silence_duration_ms=300)
+
+speech_dict = vad_iterator(tensor_frame, return_seconds=False)
+if 'start' in speech_dict:
+    is_speaking = True; speech_buffer.clear()
+elif 'end' in speech_dict:
+    is_speaking = False; self._emit_chunk(speech_buffer)
+else:
+    if is_speaking: speech_buffer.append(frame)  # 持续说话中
+```
+
+**优势**：
+- 零校准，启动即用
+- 300ms 内部静音缓冲，避免短暂停顿误切
+- 对轻声和背景噪声鲁棒
+- 删除所有能量 VAD 常量（`NOISE_FLOOR_*`, `ENERGY_SPEECH_RATIO` 等）和 `_rms()` 方法
+
+**依赖**：新增 `torchaudio`（Silero VAD hubconf 顶层导入需要）
+
+---
+
+### 10.2 异步线程池 — 消除 Gemini 阻塞
+
+**文件**：`ai_processor.py`
+
+#### 问题
+
+v0.8 hybrid 模式：Qwen 出草稿 → **同步等待 Gemini 返回** → 精修入队。Gemini 网络延迟 2-5s，主线程在此期间无法处理新音频块，队列积压。
+
+#### 方案
+
+引入 `concurrent.futures.ThreadPoolExecutor(max_workers=3)`：
+
+```python
+# 主线程：秒出草稿，不等待
+draft_result = translator.translate(english_text, context_str)
+result_queue.put({"history": current_history, "draft": draft_zh})
+
+# Gemini 精修提交到后台线程池
+def gemini_refine_task(en_text):
+    result = engine.translate(en_text, en_hist_copy, zh_hist_copy)
+    ...
+
+api_executor.submit(gemini_refine_task, english_text)
+# 主线程立即回去接下一个音频块
+```
+
+**同时删除**：音频队列的积压跳过逻辑（`dropped += 1` 那段）。不再丢弃任何切片。
+
+---
+
+### 10.3 全局历史状态机 + 追溯修正
+
+**文件**：`ai_processor.py`
+
+#### 旧方案
+
+TranslationEngine 内部维护 `_en_history`/`_zh_history`（deque），`ai_worker_thread` 也有另一套历史。两套状态容易不一致。
+
+每条翻译独立 `msg_id`，UI 端用 `OrderedDict` 按 ID 匹配更新。
+
+#### 新方案
+
+**TranslationEngine 无状态化**：历史由外部传入。
+
+```python
+class TranslationEngine:
+    def translate(self, current_text: str, en_hist: list, zh_hist: list) -> dict:
+        ...
+
+# 调用方
+engine.translate(en_text, en_hist_copy, zh_hist_copy)
+```
+
+**全局唯一真理**：`ai_worker_thread` 维护唯一的 `en_history`/`zh_history`（`list`），`history_lock` 保护所有读写。
+
+**追溯修正**：Gemini 返回后，`zh_history[-1] = final` 直接覆写最后一条。调用方不知道也不关心是合并还是新句。
+
+**消息格式简化**：
+
+```python
+# 旧: {"msg_id": ..., "final_translation": ..., "draft_translation": ...}
+# 新: {"history": ["句1", "句2"], "draft": "当前草稿..."}
+```
+
+UI 每次收到完整的 history 数组 + 当前草稿，直接重新渲染。
+
+---
+
+### 10.4 HTML 多行滚动字幕
+
+**文件**：`ui_main.py`
+
+#### 旧方案
+
+两个 QLabel（`final_label` + `draft_label`），逐条覆盖，旧消息消失。
+
+#### 新方案
+
+单个 `display_label`，HTML 富文本多行渲染：
+
+```python
+lines = []
+for text in history:
+    lines.append(f"<span style='color: #FFF; font-style: normal;'>{text}</span>")
+if draft:
+    lines.append(f"<span style='color: #DDD; font-style: italic;'>{draft}</span>")
+
+html = "<br><br>".join(lines)
+self.display_label.setText(html)
+```
+
+- 历史句：白色正体，`<br><br>` 双倍行距分隔
+- 当前草稿：浅灰斜体，视觉上与已定型句子区分
+- `AlignBottom | AlignHCenter`：底部对齐，新句往上顶
+
+删除 `OrderedDict` 消息池和 `msg_id` 比对逻辑。
+
+---
+
+### 10.5 Qwen Prompt 强化 — 防止英文复读
+
+**文件**：`ai_processor.py`
+
+#### 问题
+
+1.5B 模型偶发输出英文原文，即使 system prompt 已写明"只输出中文"。
+
+#### 方案
+
+三管齐下：
+
+```python
+# 1. System Prompt 升级
+"你是专业的英中同声传译员。你的唯一任务是输出纯中文译文。"
+
+# 2. User Prompt 结构化
+"请将下面这段英文翻译成流畅的中文。绝对不允许输出任何英文原文，不要有任何解释。\n\n"
+"【上文：...】\n\n"  # 上下文注入
+"需要翻译的英文：\"{text}\"\n中文翻译结果："  # 明确引导
+
+# 3. 参数调整
+max_tokens=64, temperature=0.1  # 微升温打断机械复制倾向
+
+# 4. 英文拦截阈值收紧
+if _english_ratio(raw) > 0.4:  # 从 0.5 降到 0.4
+    return {"final_translation": "", "draft_translation": ""}
+```
+
+---
+
+### 10.6 Gemini Prompt 简化
+
+**文件**：`ai_processor.py`
+
+#### 旧 Prompt（26 行）
+
+要求模型同时判断"是否合并上文"、"是否是独立新句"、"是否是纯残句"，输出 `context_rewritten` 和 `current_translation` 两个字段。
+
+问题：1.5B 以下模型无法稳定处理多字段 JSON 判断。Gemini 虽强但增加不必要的心智负担。
+
+#### 新 Prompt（14 行）
+
+```python
+TRANSLATION_PROMPT = """你是一位专业的同声传译员。请将最新的英文语音片段翻译成流畅的中文。
+
+## 历史上下文
+{context}
+
+## 当前输入片段
+"{current}"
+
+请注意：当前片段可能是一个残句。请结合历史上下文，给出最符合当前语境的中文翻译。
+必须严格输出以下 JSON 格式：
+{{
+  "final_translation": "此处填写翻译结果"
+}}"""
+```
+
+只要求一个 `final_translation` 字段。合并逻辑交给调用方：有历史就覆写 `zh_history[-1]`，无历史就 `append`。
+
+---
+
+### 10.7 STT 幻觉过滤
+
+**文件**：`stt_engine.py`
+
+#### 问题
+
+Whisper 在静音段有时会输出 "Thank you."、"Subscribe"、"Let's go." 等 YouTube 片头尾套话。
+
+#### 方案
+
+1. **`condition_on_previous_text=False`**：防止 Whisper 把上一句当模板重复输出
+2. **幻觉黑名单**：
+
+```python
+hallucinations = ["Thank you.", "Thank you", "Subscribe",
+                  "Thanks for watching.", "Let's go.", "bye", "you"]
+if transcript.strip() in hallucinations:
+    return ""
+```
+
+3. **`vad_filter=False`**：前端 Silero VAD 已做好切片，Whisper 只管识别
+
+---
+
+### 10.8 start.bat 依赖动态检测
+
+**文件**：`start.bat`
+
+在 `:install` 之前新增 `:check_deps` 标签：
+
+```batch
+:check_deps
+echo Checking dependencies status...
+"!PYTHON!" -c "import faster_whisper, llama_cpp, PyQt5, google.genai, torchaudio" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo [OK] Dependencies are already installed. Fast startup!
+    goto :run
+)
+echo [INFO] Dependencies missing or incomplete. Starting installation...
+```
+
+Conda 路径和非 Conda 路径汇合后经过此检测 → 依赖齐全秒启动，缺失则走 `:install`。
+
+新增 `:run` 标签统一出口。
+
+---
+
+### 10.9 依赖变更
+
+**`requirements.txt`**：
+
+```diff
+- transformers
+- accelerate
+- modelscope
++ torchaudio
+```
+
+- `torchaudio`：Silero VAD 的 torch.hub 顶层导入依赖
+- 移除 `transformers`/`accelerate`：v0.8 已切到 llama-cpp-python
+- 移除 `modelscope`：v0.8 已切到 huggingface_hub
+
+---
+
+### 10.10 经验教训
+
+1. **能量 VAD 本质缺陷**：基于 RMS 阈值的静音检测无法利用语音的频谱特征，校准窗口的时机决定了后续所有检测的准确性。神经 VAD（Silero）2MB 解决问题。
+2. **异步是实时系统的必要条件**：任何可能阻塞的网络 I/O 必须离线程，否则队列积压的反馈回路会迅速恶化延迟。
+3. **状态集中管理 > 分布式状态**：引擎内部状态 + 线程状态 + UI 状态 → 全局唯一 truth + lock 保护。否则追踪 bug 是噩梦。
+4. **Prompt 复杂度要与模型容量匹配**：1.5B 模型只需"翻译"一个任务，多字段 JSON + 合并判断是过度设计。Gemini 虽然能处理，但简化 Prompt 提高成功率。
+5. **多行滚动字幕比双行覆盖更符合直觉**：用户看到的是持续的对话历史，而不是闪烁替换的单行文字。history 数组一次性推送，渲染逻辑极其简单。
+6. **Whisper 的 `condition_on_previous_text` 在流式场景是陷阱**：它会让模型在看到相似音频时输出上一句的内容。同声传译场景必须关闭。
+
+---
+
 ## 最终架构
 
 ```
@@ -860,15 +1171,16 @@ Qwen2.5-1.5B GGUF (1-3s) ──→ 本地翻译 ──→ 悬浮窗
 ```
 Ai_Translator/
 ├── main.py              # 主入口，串联全链路
-├── audio_capture.py     # WASAPI 内录 + VAD 切片
-├── ai_processor.py      # AI 翻译处理器 (Qwen + Gemini)
-├── stt_engine.py        # STT 语音识别引擎 (Faster-Whisper)
-├── ui_main.py           # PyQt5 悬浮字幕窗
+├── audio_capture.py     # WASAPI 内录 + Silero VAD 切片
+├── ai_processor.py      # AI 翻译处理器 (Qwen + Gemini 异步)
+├── stt_engine.py        # STT 语音识别 (Faster-Whisper + 幻觉过滤)
+├── ui_main.py           # PyQt5 悬浮字幕窗 (HTML 多行滚动)
 ├── config_manager.py    # 配置管理（首次引导 + 持久化）
 ├── config.json          # 用户配置（API Key 等）
-├── start.bat            # Windows 双击启动
+├── start.bat            # Windows 一键启动（依赖检测 + 自动安装）
 ├── requirements.txt     # Python 依赖
 ├── dev_log.md           # 本开发日志
+├── README.md            # 项目说明
 └── .gitignore           # Git 忽略规则
 ```
 
@@ -891,12 +1203,17 @@ start.bat
 ## 经验教训
 
 1. **Python 3.13 + PyTorch DLL 地狱** → torch 必须在 PyQt5 之前导入，顺序决定生死
-2. **机器学习依赖太重** → VAD 用纯 numpy，避免 DLL 地狱
+2. **机器学习依赖太重** → VAD 用纯 numpy，避免 DLL 地狱；后来用 Silero VAD（2MB）替换，性价比极高
 3. **免费 API 有限流** → 默认纯本地模式，云端作可选补充
-4. **国内网络不稳** → ModelScope 缓存 + 离线优先，不依赖实时联网
+4. **国内网络不稳** → 缓存 + 离线优先 + 镜像加速，不依赖实时联网
 5. **用户不想配置环境变量** → config.json + 交互式引导
-6. **小模型容易"不听话"** → few-shot 示例 + 输出检测兜底
-7. **实时系统必须跳过积压** → 丢弃旧帧比累积延迟更符合用户体验
-8. **字幕 UI 状态管理** → 条件更新导致残留，必须全量设置清空旧数据
-9. **GGUF 量化是 CPU 推理的最优解** → 1.5B Q4_K_M 比 0.5B float32 更快且质量更高。CPU 推理的瓶颈是内存带宽而非计算量，量化直接减少了每次 token 生成的内存读取量。
-10. **小模型的 Prompt 上下文问题会随容量增大而缓解** → 1.5B 可以稳定理解 "翻译: ..." 的简单指令，无需像 0.5B 那样去掉所有上下文和格式要求。
+6. **小模型容易"不听话"** → few-shot 示例 + 输出检测兜底；Prompt 复杂度必须匹配模型容量
+7. **实时系统必须跳过积压** → 丢弃旧帧比累积延迟更符合用户体验（v0.9 改用异步线程池后不再需要丢弃）
+8. **字幕 UI 状态管理** → 条件更新导致残留，必须全量设置清空旧数据（v0.9 改用 history 数组全量推送）
+9. **GGUF 量化是 CPU 推理的最优解** → 1.5B Q4_K_M 比 0.5B float32 更快且质量更高。CPU 推理的瓶颈是内存带宽而非计算量，量化直接减少了每次 token 生成的内存读取量
+10. **小模型的 Prompt 上下文问题会随容量增大而缓解** → 1.5B 可以稳定理解简单指令
+11. **能量 VAD 本质缺陷** → 基于 RMS 阈值无法利用语音频谱特征，校准窗口时机决定所有后续准确性。Silero 2MB 神经网络解决
+12. **异步是实时系统的必要条件** → 任何可能阻塞的网络 I/O 必须离线程，否则队列积压反馈回路迅速恶化延迟
+13. **状态集中管理 > 分布式状态** → 全局唯一 truth + lock 保护，避免引擎/线程/UI 三套状态不一致
+14. **多行滚动字幕比双行覆盖更符合直觉** → 用户看到的是持续对话历史，history 数组一次性推送，渲染逻辑极其简单
+15. **Whisper 的 `condition_on_previous_text` 在流式场景是陷阱** → 同声传译必须关闭，否则模型看到相似音频会重复上一句

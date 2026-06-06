@@ -125,7 +125,6 @@ class SubtitleOverlay(QWidget):
     # ---------- UI 布局 ----------
 
     def _setup_ui(self):
-        # 百分比边距: 左右 20%, 上下 10%
         margin_h = int(self._win_w * 0.20)
         margin_v = int(self._win_h * 0.10)
 
@@ -133,42 +132,23 @@ class SubtitleOverlay(QWidget):
         layout.setContentsMargins(margin_h, margin_v, margin_h, margin_v)
         layout.setSpacing(8)
 
-        # 公共文字样式: 白色 + 黑色 glow 描边
-        outline = """
-            color: #FFFFFF;
-            background: transparent;
-        """
+        # 统一使用一个富文本 Label 展示滚动历史
+        self.display_label = QLabel()
+        self.display_label.setFont(QFont("Microsoft YaHei", 16, QFont.Bold))
+        self.display_label.setStyleSheet("color: transparent; background: transparent;")
+        self.display_label.setWordWrap(True)
+        self.display_label.setAlignment(Qt.AlignBottom | Qt.AlignHCenter)
 
-        # —— final_translation ——
-        self.final_label = QLabel()
-        self.final_label.setFont(QFont("Microsoft YaHei", 18, QFont.Bold))
-        self.final_label.setStyleSheet(outline)
-        self.final_label.setWordWrap(True)
-        self.final_label.setAlignment(Qt.AlignCenter)
+        glow = QGraphicsDropShadowEffect()
+        glow.setBlurRadius(5)
+        glow.setOffset(0, 0)
+        glow.setColor(QColor(0, 0, 0, 230))
+        self.display_label.setGraphicsEffect(glow)
 
-        # —— draft_translation ——
-        self.draft_label = QLabel()
-        self.draft_label.setFont(QFont("Microsoft YaHei", 13))
-        self.draft_label.setStyleSheet(outline + "font-style: italic;")
-        self.draft_label.setWordWrap(True)
-        self.draft_label.setAlignment(Qt.AlignCenter)
-
-        # 文字描边效果（白字黑边，任意背景可读）
-        for label in (self.final_label, self.draft_label):
-            glow = QGraphicsDropShadowEffect()
-            glow.setBlurRadius(5)
-            glow.setOffset(0, 0)
-            glow.setColor(QColor(0, 0, 0, 220))
-            label.setGraphicsEffect(glow)
-
-        # 初始占位文字，让窗口可见
-        self.final_label.setText("等待语音输入...")
-        self.draft_label.setText("")
+        self.display_label.setText("<span style='color: white;'>等待语音输入...</span>")
 
         layout.addStretch()
-        layout.addWidget(self.final_label)
-        layout.addWidget(self.draft_label)
-        layout.addStretch()
+        layout.addWidget(self.display_label)
 
     # ---------- 线程通信 ----------
 
@@ -178,15 +158,21 @@ class SubtitleOverlay(QWidget):
         self._fetcher.start()
 
     def update_labels(self, data: dict):
-        final = data.get("final_translation", "")
-        draft = data.get("draft_translation", "")
+        history = data.get("history", [])
+        draft = data.get("draft", "")
 
-        if final and not final.startswith("["):
-            # 最终版瞬间覆盖草稿
-            self.final_label.setText(final)
-            self.draft_label.setText("")
-        elif draft and not draft.startswith("["):
-            self.draft_label.setText(draft)
+        lines = []
+        # 1. 渲染历史记录（纯白正体字）
+        for text in history:
+            lines.append(f"<span style='color: #FFFFFF; font-style: normal;'>{text}</span>")
+
+        # 2. 渲染草稿（浅灰斜体字）
+        if draft:
+            lines.append(f"<span style='color: #DDDDDD; font-style: italic; font-weight: normal;'>{draft}</span>")
+
+        # 将多行文本用换行符连接
+        html_text = "<br><br>".join(lines)
+        self.display_label.setText(html_text)
 
     # ---------- 生命周期 ----------
 
@@ -217,10 +203,10 @@ if __name__ == "__main__":
     overlay = SubtitleOverlay(q)
     overlay.show()
 
-    # 显示一条静态示例，验证窗口样式
+    # 显示一条静态示例验证窗口样式（新格式）
     q.put({
-        "final_translation": "最终翻译", "draft_translation": "暂定翻译...",
-        "source_text": "[示例]", "timestamp": time.time(),
+        "history": ["如果我们查看", "这些销售数据"],
+        "draft": "原因在于..."
     })
     print("\n  >>> 字幕窗已启动，观察屏幕下方...\n")
 
