@@ -1,10 +1,9 @@
 numpy
 pyaudiowpatch
 faster-whisper
-transformers
 torch
-accelerate
-modelscope
+llama-cpp-python==0.3.16
+huggingface_hub
 PyQt5
 google-genai
 httpx

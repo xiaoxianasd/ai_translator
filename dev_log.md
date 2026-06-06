@@ -10,8 +10,12 @@
 7. [第五阶段：Gemini 限流与本地化](#第五阶段gemini-限流与本地化)
 8. [第六阶段：Qwen 替换 OPUS-MT](#第六阶段qwen-替换-opus-mt)
 9. [第七阶段：v0.6 稳定性与性能](#第七阶段v06-稳定性与性能)
-10. [最终架构](#最终架构)
-11. [文件清单](#文件清单)
+10. [第八阶段：v0.7 双轨状态机与 Qwen 深度优化](#第八阶段v07-双轨状态机与-qwen-深度优化)
+11. [第九阶段：v0.8 GGUF 量化 + 1.5B 模型升级](#第九阶段v08-gguf-量化--15b-模型升级)
+12. [最终架构](#最终架构)
+13. [文件清单](#文件清单)
+14. [运行方式](#运行方式)
+15. [经验教训](#经验教训)
 
 ---
 
@@ -35,7 +39,7 @@
 | 音频采集 | pyaudiowpatch + numpy | WASAPI Loopback 内录 |
 | VAD 静音检测 | 自研能量检测 | 纯 numpy，基于 RMS 分位数校准 |
 | 语音识别 (STT) | Faster-Whisper tiny | 本地免费，300MB |
-| 翻译引擎 | Qwen2.5-0.5B（+ Gemini 可选） | 默认纯本地，Gemini 可选精修 |
+| 翻译引擎 | Qwen2.5-1.5B GGUF Q4_K_M（+ Gemini 可选） | llama-cpp-python 推理，~1.2GB |
 | 前端 UI | PyQt5 | 全透明悬浮窗 |
 | 部署 | start.bat | 双击即用，自动创建 venv |
 
@@ -438,6 +442,398 @@ messages = [
 
 ---
 
+## 第八阶段：v0.7 双轨状态机与 Qwen 深度优化
+
+**日期**：2026-06-06
+
+**文件**：`ai_processor.py`, `ui_main.py`
+
+### 背景
+
+v0.6 的翻译输出是单轨的——每次翻译结果直接覆盖上一次，没有"草稿→终稿"的渐进式过渡。同时 Qwen 0.5B 在复杂 Prompt 下表现极不稳定：输出 JSON 格式错误的概率高达 80%，大量句子翻译失败后 fallback 到英文原文，或者模型崩溃后反复输出同一句翻译。
+
+本轮改造的目标：
+1. 实现 final/draft 双轨翻译输出的正确状态管理
+2. 让 Qwen 0.5B 在 CPU 上稳定产出可用翻译
+3. 前端实现"终稿瞬间覆盖草稿"的视觉效果
+
+---
+
+### 8.1 提取通用 JSON 解析器
+
+**文件**：`ai_processor.py`
+
+#### 问题
+
+`TranslationEngine` 内部有 20 行 JSON 解析逻辑（直接解析 → 提取 Markdown 代码块 → 暴力提取花括号 → 兜底），`LocalTranslator` 也需要同样的解析能力，但当时 `LocalTranslator.translate()` 返回的是纯字符串，不涉及 JSON 解析。
+
+#### 解决方案
+
+将 JSON 解析逻辑提取为模块级函数 `parse_translation_json(raw, fallback_text) -> dict`，四级回退策略：
+
+```python
+def parse_translation_json(raw: str, fallback_text: str) -> dict:
+    # 1) 直接 json.loads
+    # 2) 提取 ```json / ``` 代码块
+    # 3) 暴力提取第一个 { 到最后一个 }
+    # 4) 兜底 → {"final_translation": "", "draft_translation": fallback_text}
+```
+
+`TranslationEngine._parse_json()` 的 20 行逻辑浓缩为一行委托：
+```python
+def _parse_json(self, raw: str) -> dict:
+    return parse_translation_json(raw, raw.strip()[:300])
+```
+
+---
+
+### 8.2 赋予 Qwen 纠错大脑（第一版 → 失败）
+
+**文件**：`ai_processor.py`
+
+#### 尝试
+
+将 `LocalTranslator.translate()` 签名从 `(text: str) -> str` 改为 `(current_text, context_str) -> dict`：
+
+- 使用 Gemini 同款的 `TRANSLATION_PROMPT`，包含上下文和历史翻译
+- System Prompt 强制要求输出 `{"final_translation": "...", "draft_translation": "..."}`
+- `max_new_tokens` 从 64 升至 128（为 JSON 结构留空间）
+- 输出通过 `parse_translation_json()` 解析
+
+#### 结果：灾难
+
+Qwen 0.5B **完全无法处理**为 Gemini 设计的复杂 Prompt。症状：
+- 80% 的输出不是合法 JSON → `parse_translation_json` 兜底返回英文原文 → UI 显示英文
+- 模型崩溃后反复输出同一句中文翻译（如连续 3 句都显示 `"非常感谢您给予如此卓越的荣誉。"`）
+- 推理延迟增加（128 tokens × 70ms/token ≈ 9秒）
+
+**教训**：0.5B 参数量的模型没有能力同时做"领域推理 + 纠错 + JSON 格式输出"。Prompt 的任务复杂度必须匹配模型容量。
+
+---
+
+### 8.3 简化 Prompt → 引入上下文续写 Bug（第二版）
+
+**文件**：`ai_processor.py`
+
+#### 尝试
+
+新增 `LOCAL_TRANSLATION_PROMPT`，去掉 JSON 要求、领域推理和纠错逻辑，只保留翻译 + 上下文：
+
+```python
+LOCAL_TRANSLATION_PROMPT = """根据上文翻译当前英文片段为流畅中文。只输出译文，不要解释。
+
+上文：
+{context}
+
+当前："{current}"
+译文："""
+```
+
+System Prompt 简化为"你是英中翻译器。只输出中文译文。不要JSON。"
+`max_new_tokens` 降回 64（后来降至 48）。
+
+上下文格式使用 Gemini 同款的带序号 EN/ZH 对照：
+```
+1. EN: "For you!"
+   ZH: "你！"
+2. EN: "This is another step in your life, but for her."
+   ZH: "这是你在人生中的另一步，但对她的祝福。"
+```
+
+#### 结果：模型把上下文当模板续写
+
+日志揭示了新的失败模式：
+
+```
+12:21:33 [翻译] See you in the next video! → 1. EN: "For you!"
+   ZH: "你好！"
+2. EN: "This is another step
+```
+
+Qwen 0.5B 看到 Prompt 中 `EN: "..." ZH: "..."` 的格式后，把它当成了**续写任务**——模型以为自己应该继续输出这个 EN/ZH 列表，而不是翻译当前英文。
+
+**教训**：小模型对 Prompt 中的格式模式极度敏感。任何看起来像"待完成模板"的结构都可能被模型当作续写目标。
+
+---
+
+### 8.4 纯中文上下文 → 依然复制（第三版）
+
+#### 尝试
+
+将上下文格式改为纯中文链，去掉英文和序号：
+```
+上文：你！；这是你在人生中的另一步，但对她的祝福。；这是一次梦想成真。请突出自己。
+```
+
+同时 `LOCAL_TRANSLATION_PROMPT` 去掉 `{context}` 段落，改为更简洁的格式。
+
+#### 结果：模型把中文历史当模板拼贴
+
+```
+12:25:56 [翻译] I am their dream come true and their dream.
+    → 这是她们的时刻。我的妈妈和爸爸都深深地。；她是她们的时刻。我妈妈和爸爸都深深地。
+```
+
+模型把上下文里的分号和中文原文直接吐了出来。给 0.5B 看任何历史文本，它都会试图复制而非理解。
+
+**教训**：0.5B 模型缺乏"区分上下文和任务"的能力。任何形式的上下文都可能被模型当作输出模板。
+
+---
+
+### 8.5 最终方案：彻底去掉上下文（第四版）
+
+**文件**：`ai_processor.py`
+
+#### 方案
+
+```python
+LOCAL_TRANSLATION_PROMPT = """将以下英文翻译为流畅中文。只输出译文，不要解释。
+
+英文："{current}"
+译文："""
+```
+
+去掉 `{context}` 占位符，`translate()` 不再将 `context_str` 注入 Prompt。模型只看到三行内容：指令 + 英文输入 + 译文标记。
+
+```python
+def translate(self, current_text: str, context_str: str = "") -> dict:
+    prompt = LOCAL_TRANSLATION_PROMPT.format(current=current_text)
+    # context_str 参数保留但不再使用
+    ...
+    # 正常路径：纯中文 → 直接作为 final_translation
+    return {"final_translation": raw, "draft_translation": ""}
+```
+
+#### 预热优化
+
+`__init__` 中加入一次 dummy 推理，提前触发 PyTorch 懒加载：
+
+```python
+dummy = self._tokenizer.apply_chat_template(
+    [{"role": "user", "content": "Hello"}], ...)
+dummy_in = self._tokenizer(dummy, return_tensors="pt")
+self._model.generate(**dummy_in, max_new_tokens=1, ...)
+```
+
+消化首次推理的 kernel 编译、KV cache 分配开销，避免真实首句翻译多等 2-3 秒。
+
+---
+
+### 8.6 重构消费者线程历史记忆
+
+**文件**：`ai_processor.py`
+
+#### 变更
+
+1. 在 `ai_worker_thread` 的 `while True:` 循环外部，新增两个滑动窗口记忆池：
+   ```python
+   en_history: deque[str] = deque(maxlen=3)
+   zh_history: deque[str] = deque(maxlen=3)
+   ```
+
+2. 纯本地翻译分支（`elif translator:`）：
+   - 组装中文历史上下文（不上英文，避免小模型续写）
+   - 调用 `translator.translate(english_text, context_str)`
+   - 提取返回 dict 中的 `final_translation` 和 `draft_translation`
+   - **仅当 final 有效且不是错误标记时**才追加到历史队列
+
+3. 混合模式分支（`if hybrid:`）同步更新：
+   - 本地秒出草稿阶段同样使用中文历史上下文
+   - Gemini 精修成功后同步更新 `en_history`/`zh_history`
+   - Gemini 失败时草稿升格为终稿，也记入历史
+
+#### 关键约束
+
+历史记忆只在翻译**成功产出有效 final** 后才追加。避免错误翻译污染历史，导致后续句子的上下文被带偏。
+
+---
+
+### 8.7 前端视觉覆盖：终稿瞬间覆盖草稿
+
+**文件**：`ui_main.py`
+
+#### 旧逻辑（v0.6）
+
+条件更新——有 final 就设 final_label，有 draft 就设 draft_label。问题：draft 和 final 可能同时显示，造成字幕重叠。
+
+#### 新逻辑（v0.7）
+
+```python
+def update_labels(self, data: dict):
+    final = data.get("final_translation", "")
+    draft = data.get("draft_translation", "")
+
+    if final and not final.startswith("["):
+        # 终稿出现 → 瞬间清空草稿
+        self.final_label.setText(final)
+        self.draft_label.setText("")
+    elif draft and not draft.startswith("["):
+        # 仅有草稿 → 更新草稿行，终稿保持
+        self.draft_label.setText(draft)
+```
+
+双轨状态机的语义：
+- **终稿优先**：一旦 final 有值，立即占领字幕区，草稿清零
+- **草稿兜底**：只有草稿时，显示在副行（斜体小字），终稿行保持上一句不动
+- **错误过滤**：以 `[` 开头的内部标记（`[翻译错误]`、`[API异常]` 等）不显示
+
+---
+
+### 8.8 端到端延迟分析
+
+#### 流水线各阶段耗时
+
+| 阶段 | 耗时 | 瓶颈 |
+|------|------|------|
+| VAD 音频积累 | 3~5秒 | `MAX_CHUNK_DURATION_SEC=5`，首句额外 1.6s 校准 |
+| Faster-Whisper STT | 1~2秒 | tiny 模型已是最小，到极限 |
+| Qwen 翻译 | 2~4秒 | 0.5B float32 CPU，48 tokens × 70ms |
+| **合计** | **6~11秒** | |
+
+#### 延迟构成分析
+
+```
+VAD 积累 (3~5s) → STT (1~2s) → Qwen 翻译 (2~4s) → UI 显示
+```
+
+三个阶段完全串行。最大的延迟来源：
+1. **音频积累**（40%）：VAD 等待停顿或 max_duration 触发
+2. **Qwen 推理**（35%）：受限于 DDR4 内存带宽（~25GB/s），每个 token 需读一遍 2GB 权重
+3. **STT 识别**（15%）：tiny 模型已无优化空间
+4. **其他**（10%）：队列通信、Python 开销
+
+#### 可选优化（未执行）
+
+| 改动 | 预期收益 | 代价 |
+|------|----------|------|
+| `MAX_CHUNK_DURATION_SEC` 5→3 | -1~2秒 | 更碎切片，可能截断句子 |
+| `max_new_tokens` 48→32 | -1秒 | 长译文被截断 |
+| 换 NLLB-600M 翻译模型 | -2~3秒 | 需重写翻译模块，失去纠错能力 |
+| Qwen GGUF Q4 量化 + 1.5B | -1秒 + 质量质变 | 需要改推理框架 |
+
+---
+
+### 8.9 经验教训
+
+1. **Prompt 复杂度必须匹配模型容量**：0.5B 模型无法同时做领域推理 + 纠错 + JSON 格式输出。每次尝试增加 Prompt 复杂度都导致质量下降。
+2. **小模型把上下文当模板**：EN/ZH 对照格式、纯中文链、任何看起来像"待续写"的结构都会诱导模型复制而非翻译。
+3. **0.5B 的最佳 Prompt 是零上下文**：去掉所有历史信息后，模型反而能稳定产出可用的翻译。
+4. **JSON 输出对 0.5B 是奢侈品**：要求 0.5B 模型输出结构化 JSON 的成功率 <20%。让模型做它擅长的事（直译），代码负责结构化包装。
+5. **延迟构成要量化分析再优化**：首句延迟 ≠ 翻译慢，可能是 VAD 校准（1.6s）+ 音频积累（5s）+ Qwen 冷启动（2-3s）的叠加。盲目优化翻译是浪费精力。
+6. **PyTorch 首次推理有隐蔽的懒加载开销**：kernel 编译 + KV cache 分配在第一次 `generate()` 时触发，一条 dummy 预热即可化解。
+
+---
+
+## 第九阶段：v0.8 GGUF 量化 + 1.5B 模型升级
+
+**日期**：2026-06-06
+
+**文件**：`ai_processor.py`, `requirements.txt`, `config.json`, `config_manager.py`, `main.py`
+
+### 背景
+
+v0.7 在 0.5B float32 模型上通过简化 Prompt 获得了稳定输出，但翻译质量仍然受限于模型容量。dev_log 8.8 节的延迟分析指出了最高收益的优化方向：
+
+| 改动 | 预期收益 | 代价 |
+|------|----------|------|
+| **Qwen GGUF Q4 量化 + 1.5B** | **-1秒 + 质量质变** | 需要改推理框架 |
+
+核心洞察：当前 0.5B float32 推理受限于 DDR4 内存带宽（~25GB/s），每个 token 需读一遍 2GB 权重。1.5B Q4_K_M 量化后权重仅 ~1GB，每个 token 内存读取量减半，**速度反超 float32 0.5B**，同时模型容量提升 3 倍带来翻译质量质变。
+
+### 9.1 推理框架切换：transformers → llama-cpp-python
+
+#### 旧方案
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+model = AutoModelForCausalLM.from_pretrained(path, dtype=torch.float32, device_map="cpu")
+# 每次推理：手动词条化 + generate + 解码
+```
+
+#### 新方案
+
+```python
+from llama_cpp import Llama
+self._llm = Llama(model_path=model_path, n_ctx=1024, n_threads=n_threads, verbose=False)
+# 每次推理：一行 create_chat_completion 搞定
+response = self._llm.create_chat_completion(
+    messages=[...],
+    max_tokens=48,
+    temperature=0,
+)
+```
+
+**优势**：
+- `create_chat_completion()` 自动应用 Qwen chat template，无需手动拼接 tokenizer
+- GGUF 格式原生支持多种量化（Q4_K_M 等），开箱即用
+- 纯 C++ 推理核心，无 PyTorch 懒加载开销
+
+### 9.2 模型获取：HuggingFace 替代 ModelScope
+
+**旧方案**：`modelscope.snapshot_download()` — 国内网络不稳时超时/崩溃
+
+**新方案**：
+```
+启动 → 检查 config.json local_model_path
+  ├── 用户指定 → 直接使用
+  └── 为空 → 检查 ~/.cache/ai_translator/models/
+       ├── 已缓存 → 直接使用（零网络请求）
+       └── 未缓存 → huggingface_hub 下载 (~1.2GB)
+            repo: bartowski/Qwen2.5-1.5B-Instruct-GGUF
+            mirror: export HF_ENDPOINT=https://hf-mirror.com
+```
+
+`huggingface_hub` 自带断点续传和缓存校验，比 ModelScope 更可靠。同时保留离线优先：缓存命中时零网络请求。
+
+### 9.3 依赖变更
+
+```diff
+- transformers       # Qwen 0.5B float32 推理
+- accelerate         # transformers device_map="cpu" 所需
+- modelscope         # 模型下载
++ llama-cpp-python   # GGUF 推理引擎
++ huggingface_hub    # 模型下载（断点续传 + 镜像加速）
+```
+
+`torch` 保留 — Faster-Whisper 的 ctranslate2 仍然依赖它，且 `main.py` 需要在 PyQt5 之前导入 torch 解决 DLL 冲突。
+
+### 9.4 配置新增
+
+`config.json` 新增 `local_model_path` 字段：
+
+```json
+{
+  "local_model_path": ""
+}
+```
+
+留空 = 自动下载到 `~/.cache/ai_translator/models/`。用户可手动指定已下载的 GGUF 文件路径。
+
+### 9.5 Prompt 简化
+
+去掉了 `LOCAL_TRANSLATION_PROMPT` 常量和手动拼接流程。新实现直接在 `create_chat_completion` 的 messages 中指定 system prompt：
+
+```python
+messages=[
+    {"role": "system", "content": "你是英中翻译器。只输出中文译文。不要解释。"},
+    {"role": "user", "content": f"翻译: {current_text}"},
+]
+```
+
+1.5B 模型对简单指令的响应远好于 0.5B，无需 few-shot 示例或复杂的输出约束。
+
+### 9.6 预期性能对比
+
+| 指标 | v0.7 (0.5B float32) | v0.8 (1.5B Q4_K_M) |
+|------|---------------------|---------------------|
+| 模型大小 | 2GB (float32) | ~1.2GB (Q4_K_M) |
+| 每 token 内存读取 | ~2GB | ~1GB |
+| 推理速度 | 70ms/token | ~35ms/token（预估） |
+| 翻译延迟 | 2~4s (48 tokens) | 1~2s (48 tokens) |
+| 翻译质量 | 可接受 | 良好 |
+
+---
+
 ## 最终架构
 
 ```
@@ -450,7 +846,7 @@ WASAPI Loopback ──→ 能量 VAD 切片
 Faster-Whisper tiny + 动态记忆池 ──→ 英文文本（含上下文纠错）
     │
     ▼
-Qwen2.5-0.5B (3-6s) ──→ 本地翻译 ──→ 悬浮窗
+Qwen2.5-1.5B GGUF (1-3s) ──→ 本地翻译 ──→ 悬浮窗
     │
     └──→ (可选) Gemini 精修
 ```
@@ -502,3 +898,5 @@ start.bat
 6. **小模型容易"不听话"** → few-shot 示例 + 输出检测兜底
 7. **实时系统必须跳过积压** → 丢弃旧帧比累积延迟更符合用户体验
 8. **字幕 UI 状态管理** → 条件更新导致残留，必须全量设置清空旧数据
+9. **GGUF 量化是 CPU 推理的最优解** → 1.5B Q4_K_M 比 0.5B float32 更快且质量更高。CPU 推理的瓶颈是内存带宽而非计算量，量化直接减少了每次 token 生成的内存读取量。
+10. **小模型的 Prompt 上下文问题会随容量增大而缓解** → 1.5B 可以稳定理解 "翻译: ..." 的简单指令，无需像 0.5B 那样去掉所有上下文和格式要求。
