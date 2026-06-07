@@ -1,5 +1,7 @@
 # AI 同声传译助手
 
+DEMO视频:https://www.bilibili.com/video/BV15jEs65Edb/?spm_id_from=333.1387.homepage.video_card.click&vd_source=ef6e5a4aea9d9c2f393799bb2f329af0
+
 实时英文语音 → 中文翻译 → 桌面悬浮字幕，100% 本地运行。
 
 ## 环境准备
