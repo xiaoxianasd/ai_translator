@@ -164,7 +164,7 @@ class FasterWhisperSTT(BaseSTTEngine):
     language : str    识别语言（默认 "en"）
     """
 
-    def __init__(self, model_size: str = "tiny", device: str = "cpu", language: str = "en"):
+    def __init__(self, model_size: str = "tiny", device: str = "cuda", language: str = "en"):
         import os as _os, sys as _sys
         if _sys.platform == "win32":
             import torch as _torch
@@ -174,9 +174,11 @@ class FasterWhisperSTT(BaseSTTEngine):
 
         self._language = language
         self._memory = ""  # 动态记忆池，随识别累积，用作 initial_prompt 提供上下文
-        logger.info("正在加载 Faster-Whisper 模型 (%s)...", model_size)
+
+        compute_type = "float16" if device == "cuda" else "int8"
+        logger.info("正在加载 Faster-Whisper 模型 (%s, %s)...", model_size, device)
         self._model = WhisperModel(
-            model_size, device=device, compute_type="int8",
+            model_size, device=device, compute_type=compute_type,
             local_files_only=True,
         )
         logger.info("Faster-Whisper 模型就绪 (%s)", model_size)

@@ -3,7 +3,7 @@ pyaudiowpatch
 faster-whisper
 torch
 torchaudio
-llama-cpp-python==0.3.16
+llama-cpp-python
 huggingface_hub
 PyQt5
 google-genai
