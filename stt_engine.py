@@ -189,17 +189,19 @@ class FasterWhisperSTT(BaseSTTEngine):
                 language=self._language,
                 beam_size=1,
                 initial_prompt=self._memory or None,
-                vad_filter=True,
-                vad_parameters=dict(
-                    min_silence_duration_ms=300,
-                ),
+                vad_filter=False,
+                condition_on_previous_text=False,
             )
             texts = [seg.text.strip() for seg in segments if seg.text.strip()]
             transcript = " ".join(texts)
 
+            # 幻觉黑名单过滤
+            hallucinations = ["Thank you.", "Thank you", "Subscribe", "Thanks for watching.", "Let's go.", "bye", "you"]
+            if transcript.strip() in hallucinations:
+                return ""
+
             if transcript:
                 logger.debug("Whisper 识别: %s", transcript)
-                # 追加到记忆池，滑动窗口只保留最后 200 个字符
                 self._memory = (self._memory + " " + transcript)[-200:].strip()
             return transcript
         except Exception as e:

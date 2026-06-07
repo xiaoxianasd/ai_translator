@@ -1,13 +1,13 @@
 """
-audio_capture.py — Windows 系统音频流捕获与 VAD 静音切片
+audio_capture.py — Windows 系统音频流捕获与 Silero VAD 静音切片
 
 功能：
 - 通过 pyaudiowpatch 抓取 WASAPI Loopback 虚拟通道，实现对系统播放声音的内录
-- 基于 RMS 能量检测（纯 numpy，零 ML 依赖）实时判别人声/静音
-- 连续检测到 500ms 以上静音时，将缓冲区中的语音数据合并为一个 Chunk
+- 基于 Silero VAD 神经网络模型实时判别人声/静音
+- VADIterator 自动检测 speech start/end 边界，buffer 间语音帧后整体切片入队
 - 通过 queue.Queue 异步将切片发送给下游消费者
 
-依赖：pyaudiowpatch, numpy
+依赖：pyaudiowpatch, numpy, torch
 """
 
 import queue
@@ -16,44 +16,51 @@ import time
 import logging
 import numpy as np
 import pyaudiowpatch as pyaudio
+import torch
 
 logger = logging.getLogger("audio_capture")
 
 # ======================== 配置常量 ========================
 TARGET_SAMPLE_RATE = 16000         # 输出音频采样率（Hz）
-VAD_FRAME_SIZE = 512               # 每帧采样点数（= 32ms @ 16kHz）
-SILENCE_THRESHOLD_MS = 600         # 连续静音多久后触发切片（毫秒）
-MIN_CHUNK_DURATION_SEC = 0.8      # 最短切片（秒），过短丢弃
-MAX_CHUNK_DURATION_SEC = 5         # 最长切片（秒）
+VAD_FRAME_SIZE = 512               # 每帧采样点数（Silero 要求严格的 512 或 256）
+MIN_CHUNK_DURATION_SEC = 0.5       # 最短切片（秒）
+MAX_CHUNK_DURATION_SEC = 4         # 最长强制截断时间（秒）
 READ_CHUNK_DURATION_SEC = 0.1      # 每次从声卡读取的源音频时长（秒）
-SILENCE_FRAME_COUNT = int(SILENCE_THRESHOLD_MS / 32)  # 静音帧数阈值
-
-# 能量 VAD 参数
-ENERGY_SPEECH_RATIO = 1.5           # RMS 超过噪声基准 N 倍 → 判定为语音
-NOISE_FLOOR_MIN = 0.002             # 噪声基准下限
-NOISE_FLOOR_MAX = 0.03              # 噪声基准上限（防止偏高）
-CALIBRATION_FRAMES = 50             # 校准帧数
 
 
 class AudioCapture:
-    """Windows 系统音频内录 + 能量检测 VAD 切片器
+    """Windows 系统音频内录 + Silero VAD 切片器
 
     对每个从 WASAPI 抓取的音频帧：
     1. 转换字节流 → float32 多声道数组
     2. 多声道 → 单声道（取均值）
     3. 重采样到 16kHz
-    4. 拆分为 32ms 微帧，逐帧计算 RMS 能量判断语音/静音
-    5. 语音帧 → 写入缓冲区；静音帧 → 计数器 +1
-    6. 静音计数器 >= 16 帧（512ms）且缓冲区非空 → 合并发送到队列
+    4. 拆分为 512 采样点微帧，逐帧送入 Silero VADIterator
+    5. VADIterator 自动检测 speech start/end → 切片入队
     """
 
     def __init__(self, audio_queue: queue.Queue):
         self._queue = audio_queue
         self._stop_event = threading.Event()
-        self.calibrated = threading.Event()     # 校准完成信号
+        self.calibrated = threading.Event()
         self._pa: pyaudio.PyAudio | None = None
         self._stream = None
         self._thread: threading.Thread | None = None
+
+        # --- 静态加载 Silero VAD ---
+        logger.info("正在加载 Silero VAD 模型 (~2MB)...")
+        try:
+            self.vad_model, utils = torch.hub.load(
+                repo_or_dir='snakers4/silero-vad',
+                model='silero_vad',
+                force_reload=False
+            )
+            self.VADIterator = utils[3]
+            logger.info("Silero VAD 模型就绪")
+            self.calibrated.set()
+        except Exception as e:
+            logger.error("Silero VAD 加载失败，请检查网络连接: %s", e)
+            raise
 
     # ==================== 设备查找 ====================
 
@@ -119,15 +126,10 @@ class AudioCapture:
         t_new = np.linspace(0, duration, n_out, endpoint=False)
         return np.interp(t_new, t_old, audio).astype(np.float32)
 
-    @staticmethod
-    def _rms(frame: np.ndarray) -> float:
-        """计算帧的 RMS 能量值"""
-        return float(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
-
     # ==================== 主采集循环 ====================
 
     def _run(self):
-        """后台线程主循环：打开音频流 → 循环读取 → 能量 VAD 判别 → 切片入队"""
+        """后台线程主循环：打开音频流 → 循环读取 → Silero VAD 判别 → 切片入队"""
         self._pa = pyaudio.PyAudio()
 
         try:
@@ -161,20 +163,17 @@ class AudioCapture:
 
             logger.info(">>> 音频采集已启动，开始监听...")
 
-            # ---- 3. 能量 VAD 切片状态机 ----
+            # ---- 3. 神经网络 VAD 切片状态机 ----
+            vad_iterator = self.VADIterator(
+                self.vad_model,
+                threshold=0.5,
+                sampling_rate=TARGET_SAMPLE_RATE,
+                min_silence_duration_ms=300
+            )
+
             speech_buffer: list[np.ndarray] = []
-            silence_frame_count = 0
-            speech_frame_total = 0
-            noise_floor = NOISE_FLOOR_MIN       # 噪声基准（自动校准前默认值）
-            calib_samples: list[float] = []    # 校准期收集的 RMS 值
-            calibrated = False
-
-            silence_threshold_frames = SILENCE_FRAME_COUNT
-            max_consecutive_frames = int(MAX_CHUNK_DURATION_SEC * 1000 / 32)
-
-            # 电平监控（每秒输出一次，方便排查）
-            _dbg_frame_count = 0
-            _dbg_last_report = time.time()
+            is_speaking = False
+            max_consecutive_frames = int(MAX_CHUNK_DURATION_SEC * TARGET_SAMPLE_RATE / VAD_FRAME_SIZE)
 
             while not self._stop_event.is_set():
                 try:
@@ -192,56 +191,32 @@ class AudioCapture:
                 n_frames = len(resampled) // VAD_FRAME_SIZE
 
                 for i in range(n_frames):
-                    start = i * VAD_FRAME_SIZE
-                    frame = resampled[start:start + VAD_FRAME_SIZE]
-                    rms = self._rms(frame)
+                    start_idx = i * VAD_FRAME_SIZE
+                    frame = resampled[start_idx:start_idx + VAD_FRAME_SIZE]
 
-                    # ---- 自动校准噪声基准 ----
-                    if not calibrated:
-                        calib_samples.append(rms)
-                        if len(calib_samples) >= CALIBRATION_FRAMES:
-                            # 取 20% 分位数作为噪声基准（代表安静间隙，抗干扰）
-                            noise_floor = float(np.percentile(calib_samples, 20))
-                            # 限幅：不能太低（防静音下太敏感），不能太高（防校准跑偏）
-                            noise_floor = max(NOISE_FLOOR_MIN, min(NOISE_FLOOR_MAX, noise_floor))
-                            calibrated = True
-                            logger.info("VAD 校准完成 | 噪声基准=%.5f | 语音阈值=%.5f | 采样%d帧",
-                                        noise_floor, noise_floor * ENERGY_SPEECH_RATIO,
-                                        len(calib_samples))
-                            self.calibrated.set()
-                        continue
+                    tensor_frame = torch.from_numpy(frame)
+                    speech_dict = vad_iterator(tensor_frame, return_seconds=False)
 
-                    # ---- 电平监控（每5秒打印一次） ----
-                    _dbg_frame_count += 1
-                    _now = time.time()
-                    if _now - _dbg_last_report >= 5.0:
-                        _dbg_last_report = _now
-                        sp_th = noise_floor * ENERGY_SPEECH_RATIO
-                        pct = (rms / sp_th * 100) if sp_th > 0 else 0
-                        logger.info("电平监控 | 当前RMS:%.5f | 语音阈值:%.5f | 占比:%d%% | 缓冲:%d帧",
-                                     rms, sp_th, int(pct), len(speech_buffer))
+                    if speech_dict is not None:
+                        if 'start' in speech_dict:
+                            is_speaking = True
+                            speech_buffer.clear()
+                            speech_buffer.append(frame.copy())
 
-                    # ---- 语音 / 静音判断 ----
-                    if rms > noise_floor * ENERGY_SPEECH_RATIO:
-                        speech_buffer.append(frame.copy())
-                        silence_frame_count = 0
-                        speech_frame_total += 1
-                    else:
-                        silence_frame_count += 1
-                        if silence_frame_count >= silence_threshold_frames:
-                            if speech_buffer:
-                                self._emit_chunk(speech_buffer)
-                                speech_buffer.clear()
-                                speech_frame_total = 0
-                            silence_frame_count = silence_threshold_frames
-
-                    # ---- 长段保护 ----
-                    if speech_frame_total >= max_consecutive_frames:
-                        if speech_buffer:
+                        elif 'end' in speech_dict:
+                            is_speaking = False
+                            speech_buffer.append(frame.copy())
                             self._emit_chunk(speech_buffer)
                             speech_buffer.clear()
-                            speech_frame_total = 0
-                            silence_frame_count = 0
+                    else:
+                        if is_speaking:
+                            speech_buffer.append(frame.copy())
+
+                            if len(speech_buffer) >= max_consecutive_frames:
+                                self._emit_chunk(speech_buffer)
+                                speech_buffer.clear()
+                                vad_iterator.reset_states()
+                                is_speaking = False
 
         except Exception:
             logger.exception("音频采集线程发生未预期异常")

@@ -66,7 +66,7 @@ if defined CONDA (
         exit /b 1
     )
     echo [OK] Python: !PYTHON!
-    goto :install
+    goto :check_deps
 )
 
 :: 2) No conda - look for system Python
@@ -105,6 +105,16 @@ if not exist "%VENV%\Scripts\python.exe" (
 )
 set "PYTHON=%VENV%\Scripts\python.exe"
 echo [OK] Using project venv
+
+:: ========== Dependency detection ==========
+:check_deps
+echo Checking dependencies status...
+"!PYTHON!" -c "import faster_whisper, llama_cpp, PyQt5, google.genai, torchaudio" >nul 2>&1
+if !ERRORLEVEL! EQU 0 (
+    echo [OK] Dependencies are already installed. Fast startup!
+    goto :run
+)
+echo [INFO] Dependencies missing or incomplete. Starting installation...
 
 :: ========== Install deps ==========
 :install
@@ -151,6 +161,7 @@ echo.
 if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
 
 :: ========== Run ==========
+:run
 echo ============================================================
 echo.
 "!PYTHON!" main.py
