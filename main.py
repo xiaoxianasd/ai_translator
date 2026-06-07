@@ -36,7 +36,7 @@ logger = logging.getLogger("main")
 
 def main():
     print("=" * 60)
-    print("  AI 同声传译助手 v0.6")
+    print("  AI 同声传译助手 v0.8")
     print("  100% 本地运行 · 永久免费")
     print("=" * 60)
     print()
@@ -45,7 +45,7 @@ def main():
     stt_cfg = get_stt_config()
 
     print(f"  STT:  {stt_cfg['provider']} (本地)")
-    print(f"  翻译: {'Qwen + Gemini 混合' if api_key else 'Qwen 本地'}")
+    print(f"  翻译: {'Qwen 1.5B + Gemini 混合' if api_key else 'Qwen 1.5B GGUF 本地'}")
     print()
 
     # ==== 预加载模型（监听前完成，避免下载拖慢） ====
@@ -55,7 +55,7 @@ def main():
 
     from ai_processor import LocalTranslator
     translator = LocalTranslator()
-    print(f"  翻译就绪 (Qwen{' + Gemini' if api_key else ''})")
+    print(f"  翻译就绪 (Qwen 1.5B GGUF{' + Gemini' if api_key else ''})")
     print()
 
     # ==== 启动 ====

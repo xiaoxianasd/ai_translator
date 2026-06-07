@@ -2,97 +2,157 @@
 setlocal enabledelayedexpansion
 chcp 65001 >nul
 cd /d "%~dp0"
-title AI 同声传译助手
+title AI TongShengChuanYi ZhuShou
 
 echo ============================================================
-echo   AI 同声传译助手
+echo   AI TongShengChuanYi ZhuShou
 echo ============================================================
 echo.
 
-:: ========== 查找 Python ==========
-set PYTHON=
-set VENV=%CD%\.venv
+:: ========== Find Conda / Python ==========
+set CONDA=
+set CONDA_ROOT=
+set SYSTEM_PYTHON=
 
-:: 1) 优先用项目自带的虚拟环境
-if exist "%VENV%\Scripts\python.exe" (
-    set PYTHON=%VENV%\Scripts\python.exe
-    echo [OK] 使用项目虚拟环境
-    goto :check
-)
-
-:: 2) 优先用 Anaconda / Miniconda
+:: 1) Find conda first
 for %%d in (
-    "%USERPROFILE%\Anaconda3"
     "%USERPROFILE%\anaconda3"
-    "%USERPROFILE%\Miniconda3"
+    "%USERPROFILE%\Anaconda3"
     "%USERPROFILE%\miniconda3"
+    "%USERPROFILE%\Miniconda3"
     "F:\Anaconda3"
     "C:\ProgramData\Anaconda3"
     "C:\Anaconda3"
 ) do (
-    if exist "%%~d\python.exe" (
-        set SYSTEM_PYTHON=%%~d\python.exe
-        echo [OK] 找到 Anaconda: !SYSTEM_PYTHON!
-        goto :setup_venv
+    if not defined CONDA (
+        if exist "%%~d\Scripts\conda.exe" (
+            set "CONDA=%%~d\Scripts\conda.exe"
+            set "CONDA_ROOT=%%~d"
+            echo [OK] Found Conda: %%~d
+        )
     )
 )
 
-:: 3) 再找系统安装的 Python
-where python >nul 2>&1
-if %ERRORLEVEL%==0 (
-    for /f "delims=" %%i in ('python -c "import sys; print(sys.executable)"') do set SYSTEM_PYTHON=%%i
-    echo [OK] 找到 Python: !SYSTEM_PYTHON!
-    goto :setup_venv
+if defined CONDA (
+    :: Create/Use conda env with Python 3.12
+    call "!CONDA!" run -n ai_translator python --version >nul 2>&1
+    if !ERRORLEVEL! NEQ 0 (
+        echo.
+        echo Creating Conda env - Python 3.12, please wait...
+        echo.
+        call "!CONDA!" create -n ai_translator python=3.12 -y -q
+        if !ERRORLEVEL! NEQ 0 (
+            echo [ERROR] Conda env creation failed
+            pause
+            exit /b 1
+        )
+        echo [OK] Conda env created
+    ) else (
+        echo [OK] Using Conda env: ai_translator
+    )
+    :: Find python in conda env (search multiple possible paths)
+    for %%e in (
+        "!CONDA_ROOT!\envs\ai_translator"
+        "!USERPROFILE!\.conda\envs\ai_translator"
+        "F:\Anaconda_envs\envs\ai_translator"
+    ) do (
+        if not defined PYTHON (
+            if exist "%%~e\python.exe" set "PYTHON=%%~e\python.exe"
+        )
+    )
+    if not defined PYTHON (
+        echo [ERROR] Cannot find conda env python. Please report the path to ai_translator env.
+        pause
+        exit /b 1
+    )
+    echo [OK] Python: !PYTHON!
+    goto :install
 )
 
-:: 4) 找 Microsoft Store 安装的 Python
-where python3 >nul 2>&1
-if %ERRORLEVEL%==0 (
-    set SYSTEM_PYTHON=python3
-    echo [OK] 找到 Python3
-    goto :setup_venv
+:: 2) No conda - look for system Python
+for %%d in (
+    "%USERPROFILE%\anaconda3"
+    "%USERPROFILE%\Anaconda3"
+    "F:\Anaconda3"
+) do (
+    if not defined SYSTEM_PYTHON (
+        if exist "%%~d\python.exe" set "SYSTEM_PYTHON=%%~d\python.exe"
+    )
 )
-
-:: 5) 都没找到
-echo [ERROR] 未找到 Python，请先安装 Python 3.10+:
-echo   https://www.python.org/downloads/
-echo   安装时请勾选 "Add Python to PATH"
-pause
-exit /b 1
-
-:: ========== 创建虚拟环境并安装依赖 ==========
-:setup_venv
-echo.
-echo 正在创建虚拟环境...
-"!SYSTEM_PYTHON!" -m venv "%VENV%" --clear
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] 虚拟环境创建失败
+if not defined SYSTEM_PYTHON (
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        if not defined SYSTEM_PYTHON set "SYSTEM_PYTHON=%%i"
+    )
+)
+if not defined SYSTEM_PYTHON (
+    echo [ERROR] Python not found. Install Python 3.12 or Anaconda.
     pause
     exit /b 1
 )
-set PYTHON=%VENV%\Scripts\python.exe
 
+echo [OK] Found Python: !SYSTEM_PYTHON!
+
+:: Create venv
+set "VENV=%CD%\.venv"
+if not exist "%VENV%\Scripts\python.exe" (
+    echo Creating venv...
+    "!SYSTEM_PYTHON!" -m venv "%VENV%" --clear
+    if !ERRORLEVEL! NEQ 0 (
+        echo [ERROR] venv creation failed
+        pause
+        exit /b 1
+    )
+)
+set "PYTHON=%VENV%\Scripts\python.exe"
+echo [OK] Using project venv
+
+:: ========== Install deps ==========
+:install
 echo.
-echo 正在安装依赖包（首次约需 3-10 分钟，请耐心等待）...
-echo.
-"%PYTHON%" -m pip install -q --upgrade pip
-"%PYTHON%" -m pip install -q -r requirements.txt
-if %ERRORLEVEL% NEQ 0 (
-    echo.
-    echo [WARN] 部分依赖安装失败，尝试继续...
-    echo 如果无法运行，请手动执行: pip install -r requirements.txt
+echo Installing dependencies...
+
+if defined CONDA (
+    :: llama-cpp-python needs conda-forge (no pre-built pip wheels for Windows)
+    echo [1/2] Installing llama-cpp-python via conda...
+    call "!CONDA!" install -c conda-forge llama-cpp-python -n ai_translator -y -q
+    if !ERRORLEVEL! NEQ 0 (
+        echo [WARN] conda install failed, trying pip fallback...
+    )
 )
 
-echo.
-echo 依赖安装完成！
+echo Installing packages via pip...
+"!PYTHON!" -m pip install -q --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
+"!PYTHON!" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+if !ERRORLEVEL! NEQ 0 (
+    echo.
+    echo ============================================================
+    echo [ERROR] Package install failed.
+    echo.
+    if not defined CONDA (
+        echo llama-cpp-python requires a C++ compiler on Windows.
+        echo You have two options:
+        echo   1. Install Miniconda - recommended:
+        echo      https://docs.anaconda.com/miniconda/install/
+        echo      Only ~50MB, handles all compilation automatically.
+        echo   2. Install Visual Studio Build Tools:
+        echo      https://visualstudio.microsoft.com/downloads/
+        echo      ~3GB, adds MSVC compiler to your system.
+    ) else (
+        echo Network error. Please check your connection and try again.
+    )
+    echo ============================================================
+    pause
+    exit /b 1
+)
+echo [OK] Dependencies ready
 echo.
 
-:: ========== 检查并下载模型 ==========
-:check
-echo 正在检查模型文件...
-echo.
+:: HuggingFace mirror
+if not defined HF_ENDPOINT set "HF_ENDPOINT=https://hf-mirror.com"
 
-:: ========== 启动 ==========
-"%PYTHON%" main.py
+:: ========== Run ==========
+echo ============================================================
+echo.
+"!PYTHON!" main.py
 
 pause

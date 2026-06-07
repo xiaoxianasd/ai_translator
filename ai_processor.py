@@ -21,7 +21,6 @@ import threading
 import os
 from collections import deque
 
-import torch
 from google import genai
 
 from config_manager import get_api_key, get_stt_config
@@ -63,90 +62,161 @@ TRANSLATION_PROMPT = """你是一位极其专业的通用同声传译员。你�
 ```"""
 
 
+# ======================== 通用 JSON 解析器 ========================
+
+def parse_translation_json(raw: str, fallback_text: str) -> dict:
+    """鲁棒解析翻译 JSON，支持 Markdown 代码块、暴力提取 {} 内容"""
+    if not raw or not raw.strip():
+        return {"final_translation": "", "draft_translation": fallback_text}
+
+    # 1) 直接解析
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # 2) 提取 ```json / ``` 代码块
+    for tag in ("```json", "```"):
+        if tag in raw:
+            try:
+                s = raw.index(tag) + len(tag)
+                e = raw.index("```", s)
+                return json.loads(raw[s:e].strip())
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+    # 3) 暴力提取第一个 { 到最后一个 }
+    try:
+        a, b = raw.index("{"), raw.rindex("}") + 1
+        return json.loads(raw[a:b])
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # 4) 彻底失败 → 兜底
+    logger.warning("JSON 解析失败: %s", raw[:200])
+    return {"final_translation": "", "draft_translation": fallback_text}
+
+
 # ======================== Qwen 本地翻译引擎 ========================
 
 class LocalTranslator:
-    """Qwen2.5-0.5B 本地翻译引擎 — 永久免费，质量接近云端"""
+    """Qwen2.5-1.5B GGUF Q4_K_M 本地翻译引擎 — llama-cpp-python 推理"""
 
-    def __init__(self):
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+    MODEL_REPO = "bartowski/Qwen2.5-1.5B-Instruct-GGUF"
+    MODEL_FILE = "Qwen2.5-1.5B-Instruct-Q4_K_M.gguf"
 
-        model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-        logger.info("正在加载 Qwen2.5-0.5B 翻译模型 (~1GB)...")
+    def __init__(self, model_path: str | None = None):
+        from llama_cpp import Llama
 
-        # 先查本地缓存，避免每次启动都联网（网络不稳时会卡死）
-        cache_root = os.path.expanduser("~/.cache/modelscope/hub/models")
-        owner, repo = model_name.split("/")
-        safe_repo = repo.replace(".", "___")
-        local_path = os.path.join(cache_root, owner, safe_repo)
+        if model_path is None:
+            model_path = self._resolve_model_path()
 
-        if os.path.isdir(local_path) and os.path.exists(os.path.join(local_path, "model.safetensors")):
-            logger.info("使用本地缓存: %s", local_path)
-        else:
-            try:
-                from modelscope import snapshot_download
-                local_path = snapshot_download(model_name)
-            except Exception as e:
-                logger.warning("ModelScope 下载失败 (%s)，尝试已有缓存...", e)
-                # 回退：直接找缓存目录中匹配的文件夹
-                owner_dir = os.path.join(cache_root, owner)
-                if os.path.isdir(owner_dir):
-                    for d in os.listdir(owner_dir):
-                        if d.startswith(safe_repo[:6]):
-                            local_path = os.path.join(owner_dir, d)
-                            if os.path.isdir(local_path):
-                                logger.info("回退到缓存: %s", local_path)
-                                break
-        logger.info("模型路径: %s", local_path)
+        n_threads = max(1, os.cpu_count() - 2) if os.cpu_count() else 4
+        logger.info("正在加载 Qwen2.5-1.5B GGUF 翻译模型 (~1.2GB, %d 线程)...", n_threads)
 
-        torch.set_num_threads(max(1, os.cpu_count() - 2))
-        self._tokenizer = AutoTokenizer.from_pretrained(
-            local_path, trust_remote_code=True, local_files_only=True,
+        self._llm = Llama(
+            model_path=model_path,
+            n_ctx=1024,
+            n_threads=n_threads,
+            verbose=False,
         )
-        self._model = AutoModelForCausalLM.from_pretrained(
-            local_path, trust_remote_code=True, local_files_only=True,
-            dtype=torch.float32, device_map="cpu",
-        )
-        self._model.eval()
-        logger.info("Qwen 翻译模型就绪 (CPU 线程数: %d)", torch.get_num_threads())
 
-    def translate(self, text: str) -> str:
-        if not text.strip():
-            return ""
+        # 预热：消化首次推理开销
         try:
-            # few-shot 示例：教小模型理解"翻译 = 输出中文"的格式
-            messages = [
-                {"role": "system", "content": "你是英中翻译器。唯一任务：把用户输入的英文翻译成中文。禁止输出英文单词。只输出中文译文。不要解释。"},
-                {"role": "user", "content": "翻译: Hello, how are you today?"},
-                {"role": "assistant", "content": "你今天好吗？"},
-                {"role": "user", "content": "翻译: " + text},
-            ]
-            prompt = self._tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+            self._llm.create_chat_completion(
+                messages=[{"role": "user", "content": "Hello"}],
+                max_tokens=1,
             )
-            inputs = self._tokenizer(prompt, return_tensors="pt")
-            with torch.inference_mode():
-                outputs = self._model.generate(
-                    **inputs, max_new_tokens=64, do_sample=False, num_beams=1,
-                    pad_token_id=self._tokenizer.eos_token_id,
-                )
-            result = self._tokenizer.decode(
-                outputs[0][len(inputs.input_ids[0]):], skip_special_tokens=True
-            ).strip()
-
-            # 兜底检测：如果输出大部分是英文单词，说明模型没听话，标记为翻译失败
-            if result:
-                words = result.split()
-                if len(words) >= 3:
-                    en_count = sum(1 for w in words if w[:1].isascii() and w[:1].isalpha())
-                    if en_count / len(words) > 0.5:
-                        logger.warning("Qwen 输出含大量英文，疑似翻译失败: %s", result[:80])
-                        return "[翻译失败]"
-
-            return result
+            logger.info("Qwen GGUF 预热完成")
         except Exception as e:
-            logger.error("Qwen 翻译失败: %s", e)
-            return "[翻译错误]"
+            logger.warning("Qwen GGUF 预热失败（不影响使用）: %s", e)
+
+        logger.info("Qwen GGUF 翻译模型就绪 (CPU 线程数: %d)", n_threads)
+
+    def _resolve_model_path(self) -> str:
+        from config_manager import get_config
+        cfg = get_config()
+        user_path = cfg.get("local_model_path", "")
+        if user_path and os.path.exists(user_path):
+            logger.info("使用用户指定模型: %s", user_path)
+            return user_path
+
+        cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "ai_translator", "models")
+        local_path = os.path.join(cache_dir, self.MODEL_FILE)
+
+        if os.path.exists(local_path):
+            logger.info("使用本地缓存: %s", local_path)
+            return local_path
+
+        logger.info("模型未缓存，正在下载 (~1.2GB)...")
+        os.makedirs(cache_dir, exist_ok=True)
+
+        # 多源下载
+        try:
+            from huggingface_hub import hf_hub_download
+            downloaded = hf_hub_download(
+                repo_id=self.MODEL_REPO,
+                filename=self.MODEL_FILE,
+                local_dir=cache_dir,
+            )
+            logger.info("模型下载完成: %s", downloaded)
+            return downloaded
+        except Exception:
+            logger.info("huggingface_hub 下载失败，尝试直连...")
+
+        import httpx
+        urls = [
+            f"https://hf-mirror.com/{self.MODEL_REPO}/resolve/main/{self.MODEL_FILE}",
+            f"https://huggingface.co/{self.MODEL_REPO}/resolve/main/{self.MODEL_FILE}",
+        ]
+        last_error = None
+        for url in urls:
+            try:
+                logger.info("尝试: %s", url)
+                with httpx.Client(timeout=httpx.Timeout(600), follow_redirects=True) as client:
+                    with client.stream("GET", url) as resp:
+                        resp.raise_for_status()
+                        with open(local_path, "wb") as f:
+                            for chunk in resp.iter_bytes(chunk_size=8192):
+                                f.write(chunk)
+                logger.info("模型下载完成: %s", local_path)
+                return local_path
+            except Exception as e:
+                last_error = e
+                logger.warning("下载失败: %s", e)
+
+        raise RuntimeError(
+            f"模型自动下载失败。请手动下载:\n"
+            f"  {self.MODEL_FILE} (~1.2GB)\n"
+            f"  从: https://hf-mirror.com/{self.MODEL_REPO}/resolve/main/{self.MODEL_FILE}\n"
+            f"  放到: {cache_dir}\n"
+            f"  原始错误: {last_error}"
+        )
+
+    def translate(self, current_text: str, context_str: str = "") -> dict:
+        if not current_text.strip():
+            return {"final_translation": "", "draft_translation": ""}
+        try:
+            response = self._llm.create_chat_completion(
+                messages=[
+                    {"role": "system", "content": "你是英中翻译器。只输出中文译文。不要解释。"},
+                    {"role": "user", "content": f"翻译: {current_text}"},
+                ],
+                max_tokens=48,
+                temperature=0,
+            )
+            raw = response["choices"][0]["message"]["content"].strip()
+
+            if not raw:
+                return {"final_translation": "", "draft_translation": current_text}
+
+            if raw.startswith("{") and raw.endswith("}"):
+                return parse_translation_json(raw, current_text)
+
+            return {"final_translation": raw, "draft_translation": ""}
+        except Exception as e:
+            logger.error("Qwen GGUF 翻译失败: %s", e)
+            return {"final_translation": "", "draft_translation": f"[翻译错误] {e}"}
 
 
 # ======================== Gemini 翻译引擎 ========================
@@ -190,25 +260,7 @@ class TranslationEngine:
         return result
 
     def _parse_json(self, raw: str) -> dict:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-        for tag in ("```json", "```"):
-            if tag in raw:
-                try:
-                    s = raw.index(tag) + len(tag)
-                    e = raw.index("```", s)
-                    return json.loads(raw[s:e].strip())
-                except (json.JSONDecodeError, ValueError):
-                    pass
-        try:
-            a, b = raw.index("{"), raw.rindex("}") + 1
-            return json.loads(raw[a:b])
-        except (json.JSONDecodeError, ValueError):
-            pass
-        logger.warning("JSON 解析失败: %s", raw[:200])
-        return {"final_translation": "", "draft_translation": raw.strip()[:300]}
+        return parse_translation_json(raw, raw.strip()[:300])
 
 
 # ======================== 消费者工作线程 ========================
@@ -249,14 +301,18 @@ def ai_worker_thread(
 
     stt_name = type(stt_engine).__name__
     if hybrid:
-        tr_name = "Qwen 秒出 + Gemini 精修"
+        tr_name = "Qwen 1.5B 秒出 + Gemini 精修"
     elif engine:
         tr_name = "Gemini"
     elif translator:
-        tr_name = "Qwen 本地"
+        tr_name = "Qwen 1.5B GGUF"
     else:
         tr_name = "未启用"
     logger.info("AI 工作线程已启动 | STT=%s | 翻译=%s", stt_name, tr_name)
+
+    # 滑动窗口记忆池（供纯本地翻译及混合模式草稿使用）
+    en_history: deque[str] = deque(maxlen=CONTEXT_WINDOW_SIZE)
+    zh_history: deque[str] = deque(maxlen=CONTEXT_WINDOW_SIZE)
 
     while True:
         try:
@@ -309,8 +365,15 @@ def ai_worker_thread(
         # 翻译
         try:
             if hybrid:
-                # 混合模式：先本地秒出草稿 → 再 Gemini 精修
-                draft_zh = translator.translate(english_text)
+                # 组装中文历史供本地翻译纠错（不上英文，避免小模型续写）
+                if zh_history:
+                    context_str = "上文：" + "；".join(list(zh_history))
+                else:
+                    context_str = "暂无上文"
+
+                # 本地秒出草稿
+                draft_result = translator.translate(english_text, context_str)
+                draft_zh = draft_result.get("draft_translation", "") or draft_result.get("final_translation", "")
                 entry = {
                     "source_text": english_text,
                     "final_translation": "",
@@ -320,23 +383,27 @@ def ai_worker_thread(
                 result_queue.put(entry)
                 logger.info("[草稿] %s → %s", english_text, draft_zh[:60])
 
-                # 异步精修（同一线程内，Gemini 覆盖草稿）
+                # Gemini 精修
                 try:
                     gemini_result = engine.translate(english_text)
                 except Exception:
                     gemini_result = None
 
                 final_zh = (gemini_result or {}).get("final_translation", "")
-                if final_zh:
+                if final_zh and not final_zh.startswith("["):
                     entry["final_translation"] = final_zh
                     entry["timestamp"] = time.time()
                     entry["_refined"] = True
                     result_queue.put(entry)
+                    en_history.append(english_text)
+                    zh_history.append(final_zh)
                     logger.info("[精修] %s → %s", english_text, final_zh[:60])
-                else:
+                elif draft_zh and not draft_zh.startswith("["):
                     # Gemini 失败，草稿直接升格为最终
                     entry["final_translation"] = draft_zh
                     result_queue.put(entry)
+                    en_history.append(english_text)
+                    zh_history.append(draft_zh)
 
             elif engine:
                 result = engine.translate(english_text)
@@ -351,14 +418,28 @@ def ai_worker_thread(
                 result_queue.put(entry)
 
             elif translator:
-                zh = translator.translate(english_text)
+                # 组装中文历史（不上英文，避免小模型续写 EN/ZH 模式）
+                if zh_history:
+                    context_str = "上文：" + "；".join(list(zh_history))
+                else:
+                    context_str = "暂无上文"
+
+                result = translator.translate(english_text, context_str)
+                final_zh = result.get("final_translation", "")
+                draft_zh = result.get("draft_translation", "")
+
+                # 仅当 final 有效时才记入历史
+                if final_zh and not final_zh.startswith("[") and "[翻译" not in final_zh:
+                    en_history.append(english_text)
+                    zh_history.append(final_zh)
+
                 entry = {
                     "source_text": english_text,
-                    "final_translation": zh,
-                    "draft_translation": "",
+                    "final_translation": final_zh,
+                    "draft_translation": draft_zh,
                     "timestamp": time.time(),
                 }
-                logger.info("[翻译] %s → %s", english_text, zh[:60])
+                logger.info("[翻译] %s → %s", english_text, (final_zh or draft_zh)[:60])
                 result_queue.put(entry)
 
             else:

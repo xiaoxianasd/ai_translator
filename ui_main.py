@@ -181,16 +181,12 @@ class SubtitleOverlay(QWidget):
         final = data.get("final_translation", "")
         draft = data.get("draft_translation", "")
 
-        # 始终同步设置两个 label，空串即清空，避免旧文字残留重叠
         if final and not final.startswith("["):
+            # 最终版瞬间覆盖草稿
             self.final_label.setText(final)
-        else:
-            self.final_label.setText("")
-
-        if draft and not draft.startswith("["):
-            self.draft_label.setText(draft)
-        else:
             self.draft_label.setText("")
+        elif draft and not draft.startswith("["):
+            self.draft_label.setText(draft)
 
     # ---------- 生命周期 ----------
 

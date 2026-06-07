@@ -21,6 +21,7 @@ DEFAULT_CONFIG = {
     "ui_font_size": 18,
     "ui_opacity": 0.85,
     "setup_completed": False,     # 是否已完成首次引导
+    "local_model_path": "",       # GGUF 模型路径，留空则自动下载
 }
 
 
