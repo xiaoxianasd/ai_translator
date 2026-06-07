@@ -109,50 +109,54 @@ echo [OK] Using project venv
 :: ========== Dependency detection ==========
 :check_deps
 echo Checking dependencies status...
-"!PYTHON!" -c "import faster_whisper, llama_cpp, PyQt5, google.genai, torchaudio" >nul 2>&1
+"!PYTHON!" -c "import faster_whisper, PyQt5, google.genai, torchaudio, llama_cpp; assert hasattr(llama_cpp, 'llama_supports_gpu_offload') and llama_cpp.llama_supports_gpu_offload(), 'GPU offload not available'" >nul 2>&1
 if !ERRORLEVEL! EQU 0 (
-    echo [OK] Dependencies are already installed. Fast startup!
+    echo [OK] All dependencies ready ^(CUDA enabled^). Fast startup!
     goto :run
 )
-echo [INFO] Dependencies missing or incomplete. Starting installation...
+echo [INFO] Dependencies missing or need CUDA rebuild. Starting installation...
 
 :: ========== Install deps ==========
 :install
 echo.
-echo Installing dependencies...
+echo Installing dependencies (with CUDA acceleration)...
 
-if defined CONDA (
-    :: llama-cpp-python needs conda-forge (no pre-built pip wheels for Windows)
-    echo [1/2] Installing llama-cpp-python via conda...
-    call "!CONDA!" install -c conda-forge llama-cpp-python -n ai_translator -y -q
-    if !ERRORLEVEL! NEQ 0 (
-        echo [WARN] conda install failed, trying pip fallback...
-    )
-)
-
-echo Installing packages via pip...
+echo [1/2] Installing base packages...
 "!PYTHON!" -m pip install -q --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple
 "!PYTHON!" -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 if !ERRORLEVEL! NEQ 0 (
     echo.
     echo ============================================================
     echo [ERROR] Package install failed.
-    echo.
     if not defined CONDA (
-        echo llama-cpp-python requires a C++ compiler on Windows.
-        echo You have two options:
-        echo   1. Install Miniconda - recommended:
+        echo Some packages require a C++ compiler on Windows.
+        echo   1. Install Miniconda - recommended ^(only ~50MB^):
         echo      https://docs.anaconda.com/miniconda/install/
-        echo      Only ~50MB, handles all compilation automatically.
-        echo   2. Install Visual Studio Build Tools:
+        echo   2. Or install Visual Studio Build Tools ^(~3GB^):
         echo      https://visualstudio.microsoft.com/downloads/
-        echo      ~3GB, adds MSVC compiler to your system.
     ) else (
         echo Network error. Please check your connection and try again.
     )
     echo ============================================================
     pause
     exit /b 1
+)
+
+:: Install llama-cpp-python with CUDA pre-built wheel (no compiler needed)
+echo [2/2] Installing llama-cpp-python with CUDA acceleration...
+"!PYTHON!" -m pip uninstall -y llama-cpp-python >nul 2>&1
+"!PYTHON!" -m pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+if !ERRORLEVEL! EQU 0 (
+    echo [OK] llama-cpp-python with CUDA support installed.
+) else (
+    echo [WARN] CUDA wheel failed ^(no NVIDIA GPU or old driver?^). Falling back to CPU mode...
+    "!PYTHON!" -m pip install llama-cpp-python -i https://pypi.tuna.tsinghua.edu.cn/simple
+    if !ERRORLEVEL! NEQ 0 (
+        echo [ERROR] llama-cpp-python install failed.
+        pause
+        exit /b 1
+    )
+    echo [INFO] CPU-only mode. GPU acceleration disabled.
 )
 echo [OK] Dependencies ready
 echo.

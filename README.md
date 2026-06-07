@@ -6,21 +6,27 @@
 
 ### 前提条件
 
-**需要安装 Anaconda 或 Miniconda**（任选其一）：
+- **Python 3.12+**（推荐通过 Miniconda 管理环境，非必需但建议）
 
 | 选择 | 下载 | 大小 |
 |------|------|------|
 | Miniconda（推荐） | [docs.anaconda.com/miniconda/install/](https://docs.anaconda.com/miniconda/install/) | ~50MB |
-| Anaconda（完整版） | [anaconda.com/download](https://www.anaconda.com/download) | ~800MB |
+| 系统 Python | [python.org/downloads](https://www.python.org/downloads/) | ~25MB |
 
-> 为什么需要 Conda？翻译引擎 `llama-cpp-python` 在 Windows 上没有预编译的 pip 包，需要 MSVC 编译器才能从源码安装。Conda 提供了预编译版本，免去手动安装编译器的麻烦。
->
-> 如果你已经有 Visual Studio 和 MSVC 编译器，可以直接 Python 3.12 + pip 安装，不需要 Conda。
+> Conda 提供隔离的 Python 环境，但不是必须的。`start.bat` 会自动检测 Conda，没有则用系统 Python 创建 venv。
 
-安装完成后，打开终端验证：
+### GPU 加速（推荐）
+
+如果你有 **NVIDIA 显卡**，程序会自动启用 GPU 加速——只需显卡驱动支持 CUDA 12.1+（大多数现代驱动已满足），无需安装 CUDA Toolkit 或任何编译工具链。
+
+### 验证
 
 ```bash
+# 如果用 Conda
 conda --version
+
+# 如果用系统 Python
+python --version
 ```
 
 ## 安装运行
@@ -46,18 +52,24 @@ conda --version
 ### 手动安装
 
 ```bash
-# 1. 创建 Conda 环境
-conda create -n ai_translator python=3.12 -y
+# 1. 创建环境（二选一）
+conda create -n ai_translator python=3.12 -y       # Conda 用户
+python -m venv .venv                                 # 系统 Python 用户
 
-# 2. 安装 llama-cpp-python（预编译包）
-conda install -c conda-forge llama-cpp-python -n ai_translator -y
+# 2. 安装基础依赖
+pip install -r requirements.txt
 
-# 3. 安装其余依赖
-conda run -n ai_translator pip install -r requirements.txt
+# 3. 安装 llama-cpp-python（GPU / CPU 二选一）
+# GPU 版（NVIDIA 显卡，~50MB 预编译包，无需编译器）：
+pip uninstall -y llama-cpp-python
+pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
+
+# CPU 版（无显卡或非 NVIDIA）：
+pip install llama-cpp-python
 
 # 4. 启动（设置国内镜像加速模型下载）
 set HF_ENDPOINT=https://hf-mirror.com
-conda run -n ai_translator python main.py
+python main.py
 ```
 
 ## 可选配置（Gemini 云端精修）
@@ -112,20 +124,21 @@ conda run -n ai_translator python main.py
 |------|------|
 | 音频采集 | pyaudiowpatch + WASAPI Loopback |
 | VAD 静音检测 | Silero VAD（神经网络，~2MB） |
-| 语音识别 | Faster-Whisper tiny（本地，300MB） |
-| 翻译引擎 | Qwen2.5-1.5B GGUF Q4_K_M（llama-cpp-python，~1.2GB） |
+| 语音识别 | Faster-Whisper tiny（本地，300MB，GPU 加速） |
+| 翻译引擎 | Qwen2.5-1.5B GGUF Q4_K_M（llama-cpp-python，~1.2GB，GPU 加速） |
 | 云端精修 | Gemini 2.5 Flash（可选，异步线程池） |
 | 前端 UI | PyQt5 全透明悬浮窗 + HTML 富文本多行渲染 |
 
 ## 特性
 
 - **100% 本地运行**：无需 API Key 也能用
+- **GPU 加速**：有 NVIDIA 显卡自动启用，Qwen + Whisper 跑在显存里，无需安装 CUDA Toolkit
 - **异步混合翻译**：Qwen 主线程秒出草稿 + Gemini 后台精修，互不阻塞
-- **Silero VAD 神经网络切片**：替代能量检测，精准识别语音边界
+- **Silero VAD 神经网络切片**：替代能量检测，精准识别语音边界，零校准等待
 - **追溯修正**：Gemini 检测到残句合并时自动覆写上一句翻译
 - **全透明悬浮窗**：不遮挡视频内容，可拖动，右键锁定穿透
 - **多行滚动字幕**：历史句白色正体 + 草稿浅灰斜体，一目了然
-- **一键启动**：双击 `start.bat` 即用，自动检测依赖
+- **一键启动**：双击 `start.bat` 即用，自动检测依赖、自动安装 CUDA 版推理引擎
 - **离线可用**：模型缓存后无需联网
 - **国内友好**：自动使用 HuggingFace 和 pip 镜像加速
 
@@ -133,7 +146,17 @@ conda run -n ai_translator python main.py
 
 ### 启动时提示 "Conda not found"
 
-需要先安装 Miniconda 或 Anaconda，见[环境准备](#环境准备)。
+`start.bat` 会自动查找系统中的 Python。如果用系统 Python + venv 方案，不需要 Conda。如果你偏好 Conda，见[环境准备](#环境准备)。
+
+### 如何确认 GPU 加速已生效
+
+启动时看到 `[OK] CUDA enabled` 即表示 GPU 加速已启用。也可以在 Python 中验证：
+
+```bash
+python -c "import llama_cpp; print('CUDA:', llama_cpp.llama_supports_gpu_offload())"
+```
+
+输出 `CUDA: True` 即为 GPU 模式。否则会自动回退 CPU。
 
 ### 模型下载失败
 

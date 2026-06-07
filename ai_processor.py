@@ -108,13 +108,14 @@ class LocalTranslator:
         if model_path is None:
             model_path = self._resolve_model_path()
 
-        n_threads = max(1, os.cpu_count() - 2) if os.cpu_count() else 4
-        logger.info("正在加载 Qwen2.5-1.5B GGUF 翻译模型 (~1.2GB, %d 线程)...", n_threads)
+        n_threads = max(1, (os.cpu_count() or 4) // 2)
+        logger.info("正在加载 Qwen2.5-1.5B GGUF 翻译模型 (~1.2GB, GPU 卸载, %d 线程)...", n_threads)
 
         self._llm = Llama(
             model_path=model_path,
             n_ctx=1024,
             n_threads=n_threads,
+            n_gpu_layers=-1,
             verbose=False,
         )
 
@@ -128,7 +129,7 @@ class LocalTranslator:
         except Exception as e:
             logger.warning("Qwen GGUF 预热失败（不影响使用）: %s", e)
 
-        logger.info("Qwen GGUF 翻译模型就绪 (CPU 线程数: %d)", n_threads)
+        logger.info("Qwen GGUF 翻译模型就绪 (GPU 卸载, CPU 线程数: %d)", n_threads)
 
     def _resolve_model_path(self) -> str:
         from config_manager import get_config
